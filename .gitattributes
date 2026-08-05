@@ -1,0 +1,13 @@
+# Единые переводы строк: в репозитории всегда LF, в рабочей копии — родные для ОС
+* text=auto eol=lf
+
+*.ts   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+
+*.png  binary
+*.jpg  binary
+*.ico  binary
+
+bun.lock linguist-generated=true

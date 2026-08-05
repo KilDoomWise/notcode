@@ -1,0 +1,38 @@
+# Зависимости
+node_modules/
+.bun/
+
+# Сборка / кэши
+dist/
+build/
+out/
+*.tsbuildinfo
+coverage/
+
+# Локальные секреты и окружение (токен сервера живёт в ~/.notcode/config.json)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Локальные данные NotCode, если кто-то перенесёт их в проект
+.notcode/
+.notcode-smoke/
+audit.jsonl
+snapshots/
+
+# Логи
+*.log
+logs/
+npm-debug.log*
+bun-debug.log*
+
+# ОКружение разработчика
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
