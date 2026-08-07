@@ -77,10 +77,32 @@ export function formatDuration(ms: number): string {
     return `${minutes}m ${seconds}s`;
 }
 
-/** Кроссплатформенное экранирование аргумента для shell-строки (git-тулы). */
-export function shellQuote(value: string): string {
-    if (process.platform === "win32") {
-        return `"${value.replace(/"/g, '\\"')}"`;
-    }
+const CMD_META_CHARS = /([()%!^"<>&|;,])/g;
+
+/**
+ * Экранирование аргумента для cmd.exe, когда команда идёт через .cmd-скрипт (см. utils/shell.ts).
+ * cmd.exe перетокенизирует строку скрипта дважды (сам .cmd, затем целевая программа), поэтому
+ * простое "оберни в кавычки и заэкранируй \" бэкслешем" (старое поведение) ломается на любом
+ * значении с кавычкой внутри (например, в сообщении git-коммита). Алгоритм ниже — тот же,
+ * которым эту проблему решает cross-spawn для .bat/.cmd файлов: экранируем кавычки с учётом
+ * хвостовых бэкслешей, оборачиваем в кавычки, затем экранируем метасимволы cmd.exe через `^`.
+ * Там, где можно, предпочитай runArgv() (utils/shell.ts) — argv-спавн вообще не требует
+ * квотирования и не подвержен этой проблеме.
+ */
+export function quoteForCmd(value: string): string {
+    let arg = value.replace(/(\\*)"/g, '$1$1\\"');
+    arg = arg.replace(/(\\*)$/, "$1$1");
+    arg = `"${arg}"`;
+    return arg.replace(CMD_META_CHARS, "^$1");
+}
+
+/** Экранирование для PowerShell: одинарные кавычки — единственный настоящий литеральный синтаксис
+ *  (двойные кавычки в PowerShell всё ещё интерполируют $переменные и обратные апострофы). */
+export function quoteForPowerShell(value: string): string {
+    return `'${value.replace(/'/g, "''")}'`;
+}
+
+/** Экранирование для POSIX sh/bash: одинарные кавычки с классическим выходом для встроенных `'`. */
+export function quoteForPosixSh(value: string): string {
     return `'${value.replace(/'/g, `'\\''`)}'`;
 }

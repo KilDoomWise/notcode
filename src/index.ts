@@ -12,11 +12,18 @@ import {
     type NotCodeConfig,
     type SecurityMode
 } from "@/config";
-import { readAudit } from "@/utils/audit";
+import { readAudit, trimAuditLog } from "@/utils/audit";
+import { gcSnapshots } from "@/utils/snapshot";
+import { cleanupTempScripts } from "@/utils/shell";
 import { terminals } from "@/utils/terminal-manager";
 import { watchers } from "@/utils/watch-manager";
 
-type Session = { transport: SSEServerTransport; server: ReturnType<typeof createServer> };
+type Session = {
+    transport: SSEServerTransport;
+    server: ReturnType<typeof createServer>;
+    /** Отметка последней активности: abort прилетает не всегда, иначе сессии копятся вечно. */
+    lastSeenAt: number;
+};
 
 const transports = new Map<string, Session>();
 
@@ -162,6 +169,43 @@ async function runCli(): Promise<void> {
     }
 }
 
+/** Уборка диска: временные скрипты, снапшоты, аудит-лог. Вызывается при старте и по таймеру. */
+async function runMaintenance(config: NotCodeConfig, label: string): Promise<void> {
+    try {
+        const [temp, snapshots, auditTrim] = await Promise.all([
+            cleanupTempScripts(),
+            gcSnapshots(config),
+            trimAuditLog(config)
+        ]);
+
+        const parts: string[] = [];
+        if (temp.removed > 0) parts.push(`temp-папок: ${temp.removed}`);
+        if (snapshots.removed > 0) parts.push(`снапшотов: ${snapshots.removed}`);
+        if (auditTrim.trimmed) parts.push(`аудит обрезан до ${auditTrim.entriesKept} записей`);
+
+        if (parts.length > 0) {
+            const freed = temp.freedBytes + snapshots.freedBytes;
+            console.log(`🧹 Уборка (${label}): ${parts.join(", ")} — освобождено ~${Math.round(freed / 1024)} KB`);
+        }
+    } catch (error) {
+        console.error("⚠️  Уборка не удалась:", error);
+    }
+}
+
+/**
+ * Закрывает SSE-сессии, по которым давно не было сообщений (каждая держит свой MCP-сервер
+ * в памяти). Порог — config.limits.sseSessionIdleMs (по умолчанию 24 часа), считается от
+ * lastSeenAt, то есть от последней реальной активности сессии, а не от момента её открытия.
+ */
+function sweepSessions(maxIdleMs: number): void {
+    const cutoff = Date.now() - maxIdleMs;
+    for (const [sessionId, session] of transports) {
+        if (session.lastSeenAt >= cutoff) continue;
+        transports.delete(sessionId);
+        void session.server.close().catch(() => undefined);
+    }
+}
+
 function startServer(config: NotCodeConfig): void {
     const app = new Elysia()
         .onRequest(({ request, set }) => {
@@ -238,7 +282,7 @@ function startServer(config: NotCodeConfig): void {
             const server = createServer();
             const sessionId = transport.sessionId;
 
-            transports.set(sessionId, { transport, server });
+            transports.set(sessionId, { transport, server, lastSeenAt: Date.now() });
 
             request.signal.addEventListener("abort", () => {
                 const session = transports.get(sessionId);
@@ -267,6 +311,7 @@ function startServer(config: NotCodeConfig): void {
             }
 
             const session = transports.get(sessionId)!;
+            session.lastSeenAt = Date.now();
 
             const reqMock = {
                 method: "POST",
@@ -291,8 +336,27 @@ function startServer(config: NotCodeConfig): void {
         })
         .listen({ port: config.port, hostname: config.host });
 
+    // Фоновое обслуживание: без него всё, что не почистили тулы, копится до перезапуска.
+    const gcIntervalMs = Math.max(60_000, config.limits.gcIntervalMs);
+
+    void runMaintenance(config, "старт");
+
+    const maintenanceTimer = setInterval(() => {
+        void runMaintenance(config, "периодическая");
+        // Порог берётся из конфига (по умолчанию 24ч), а не выводится из gcIntervalMs —
+        // раньше "минимум 2 часа" было побочным эффектом периода GC, а не осознанным лимитом.
+        sweepSessions(config.limits.sseSessionIdleMs);
+    }, gcIntervalMs);
+    maintenanceTimer.unref?.();
+
+    terminals.startGc(gcIntervalMs);
+    watchers.startGc(gcIntervalMs);
+
     const shutdown = async (signal: string): Promise<void> => {
         console.log(`\n🛑 ${signal}: гасим терминалы и watcher'ы…`);
+        clearInterval(maintenanceTimer);
+        terminals.stopGc();
+        watchers.stopGc();
         await terminals.closeAll();
         watchers.stopAll();
         for (const session of transports.values()) {

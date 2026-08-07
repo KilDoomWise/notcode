@@ -1,5 +1,6 @@
 import { watch, type FSWatcher } from "node:fs";
 import { join } from "node:path";
+import { loadConfig } from "@/config";
 
 /**
  * Наблюдение за файлами: агент может узнать, что файлы изменились извне
@@ -17,6 +18,8 @@ export interface WatcherInfo {
     path: string;
     recursive: boolean;
     createdAt: string;
+    lastPolledAt: string;
+    idleTimeoutMs: number;
     pendingEvents: number;
     totalEvents: number;
     dropped: number;
@@ -34,12 +37,25 @@ interface WatcherState {
     maxEvents: number;
     lastKey: string;
     lastAt: number;
+    lastPolledAt: number;
+    idleMs: number;
 }
 
 class WatchManager {
     private readonly watchers = new Map<string, WatcherState>();
+    private gcTimer: ReturnType<typeof setInterval> | null = null;
 
-    start(options: { path: string; recursive?: boolean; maxEvents?: number }): WatcherInfo {
+    async start(options: { path: string; recursive?: boolean; maxEvents?: number }): Promise<WatcherInfo> {
+        const config = await loadConfig();
+        this.gc();
+
+        if (this.watchers.size >= config.limits.maxWatchers) {
+            throw new Error(
+                `Достигнут лимит watcher'ов (${config.limits.maxWatchers}). ` +
+                    `Каждый держит хендл ОС и копит события — останови ненужные через fs_watch_stop (список: fs_watch_list).`
+            );
+        }
+
         const id = `w-${crypto.randomUUID().slice(0, 6)}`;
         const recursive = options.recursive ?? true;
         const maxEvents = options.maxEvents ?? 500;
@@ -49,6 +65,8 @@ class WatchManager {
             path: options.path,
             recursive,
             createdAt: Date.now(),
+            lastPolledAt: Date.now(),
+            idleMs: config.limits.watcherIdleMs,
             watcher: undefined as unknown as FSWatcher,
             events: [],
             totalEvents: 0,
@@ -92,6 +110,7 @@ class WatchManager {
 
     poll(id: string, options: { clear?: boolean; limit?: number } = {}): { info: WatcherInfo; events: WatchEvent[] } {
         const state = this.require(id);
+        state.lastPolledAt = Date.now();
         const limit = options.limit ?? 200;
         const events = state.events.slice(-limit);
         if (options.clear ?? true) state.events = [];
@@ -125,6 +144,39 @@ class WatchManager {
         return ids.length;
     }
 
+    /**
+     * Останавливает watcher'ы, за которыми никто не следит.
+     * Без этого забытый fs_watch_start живёт до перезапуска сервера и бесконечно копит события.
+     */
+    gc(): { stopped: number } {
+        const now = Date.now();
+        let stopped = 0;
+
+        for (const [id, state] of this.watchers) {
+            if (now - state.lastPolledAt < state.idleMs) continue;
+            try {
+                this.stop(id);
+            } catch {
+                this.watchers.delete(id);
+            }
+            stopped++;
+        }
+
+        return { stopped };
+    }
+
+    startGc(intervalMs: number): void {
+        if (this.gcTimer) return;
+        this.gcTimer = setInterval(() => this.gc(), Math.max(30_000, intervalMs));
+        this.gcTimer.unref?.();
+    }
+
+    stopGc(): void {
+        if (!this.gcTimer) return;
+        clearInterval(this.gcTimer);
+        this.gcTimer = null;
+    }
+
     private require(id: string): WatcherState {
         const state = this.watchers.get(id);
         if (!state) {
@@ -142,6 +194,8 @@ class WatchManager {
             path: state.path,
             recursive: state.recursive,
             createdAt: new Date(state.createdAt).toISOString(),
+            lastPolledAt: new Date(state.lastPolledAt).toISOString(),
+            idleTimeoutMs: state.idleMs,
             pendingEvents: state.events.length,
             totalEvents: state.totalEvents,
             dropped: state.dropped
