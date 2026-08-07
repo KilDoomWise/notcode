@@ -4,12 +4,40 @@ import { defineTool } from "@/tools/types";
 import { formatBytes } from "@/utils/output";
 import { fail, fromError, ok } from "@/utils/result";
 import { resolveSandboxed } from "@/utils/sandbox";
-import { collectEntries } from "@/utils/walk";
+import { collectEntries, type WalkEntry } from "@/utils/walk";
+
+/**
+ * Сравнение для древовидного вывода: сегмент за сегментом, папки выше файлов НА КАЖДОМ уровне.
+ *
+ * Старая сортировка (все папки глобально, потом все файлы) при depth>1 разрывала дерево:
+ * файлы src/a.ts печатались с отступом второго уровня где-то под чужими папками, и читать его было нельзя.
+ */
+function compareTree(a: WalkEntry, b: WalkEntry): number {
+    const left = a.relPath.split("/");
+    const right = b.relPath.split("/");
+    const shared = Math.min(left.length, right.length);
+
+    for (let i = 0; i < shared; i++) {
+        const leftSegment = left[i] ?? "";
+        const rightSegment = right[i] ?? "";
+        if (leftSegment === rightSegment) continue;
+
+        // Сегмент — папка, если у пути есть продолжение или сама запись — каталог.
+        const leftIsDir = i < left.length - 1 || a.isDirectory;
+        const rightIsDir = i < right.length - 1 || b.isDirectory;
+        if (leftIsDir !== rightIsDir) return leftIsDir ? -1 : 1;
+
+        return leftSegment.localeCompare(rightSegment, "en");
+    }
+
+    return left.length - right.length;
+}
 
 export const listDirTool = defineTool({
     name: "fs_list_dir",
     description:
         "List files and directories. Supports recursive tree output with depth control, hidden files, and file sizes. Heavy folders like node_modules/.git are skipped unless includeIgnored is set.",
+    annotations: { title: "List directory", readOnlyHint: true, idempotentHint: true },
     schema: {
         path: z.string().optional().describe("Directory path (defaults to the workspace root)"),
         depth: z.number().int().min(1).max(10).optional().describe("How many levels deep to list (default 1)"),
@@ -39,7 +67,7 @@ export const listDirTool = defineTool({
                 return fail(`${target.path} — это файл. Используй fs_read_file.`);
             }
 
-            const { entries, truncated } = await collectEntries({
+            const walk = await collectEntries({
                 root: target.path,
                 maxDepth: args.depth ?? 1,
                 includeHidden: args.includeHidden,
@@ -47,32 +75,45 @@ export const listDirTool = defineTool({
                 maxEntries: args.maxEntries ?? 500
             });
 
-            if (entries.length === 0) {
+            if (walk.entries.length === 0) {
                 return ok(`${target.path}\n(пусто)`);
             }
 
-            entries.sort((a, b) => {
-                if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
-                return a.relPath.localeCompare(b.relPath);
-            });
+            const entries = [...walk.entries].sort(compareTree);
+
+            // Параллельный stat: последовательный внутри цикла давал секунды на 500 файлах.
+            const sizes = new Map<string, string>();
+            if (args.withSizes) {
+                const files = entries.filter(entry => !entry.isDirectory);
+                const results = await Promise.all(
+                    files.map(async entry => {
+                        try {
+                            return [entry.absPath, formatBytes((await stat(entry.absPath)).size)] as const;
+                        } catch {
+                            return [entry.absPath, ""] as const;
+                        }
+                    })
+                );
+                for (const [absPath, size] of results) {
+                    if (size) sizes.set(absPath, size);
+                }
+            }
 
             const lines: string[] = [`${target.path}${args.depth && args.depth > 1 ? `  (depth=${args.depth})` : ""}`];
 
             for (const entry of entries) {
                 const indent = "  ".repeat(entry.depth - 1);
                 const label = entry.isDirectory ? "[DIR] " : "[FILE]";
-                let size = "";
-                if (args.withSizes && !entry.isDirectory) {
-                    try {
-                        size = `  (${formatBytes((await stat(entry.absPath)).size)})`;
-                    } catch {
-                        size = "";
-                    }
-                }
-                lines.push(`${indent}${label} ${entry.name}${size}`);
+                const size = sizes.get(entry.absPath);
+                lines.push(`${indent}${label} ${entry.name}${size ? `  (${size})` : ""}`);
             }
 
-            lines.push("", `Всего: ${entries.length}${truncated ? " (список усечён лимитом maxEntries)" : ""}`);
+            const notes: string[] = [];
+            if (walk.truncated) notes.push("список усечён лимитом maxEntries");
+            if (walk.timedOut) notes.push("обход остановлен по времени");
+            if (walk.unreadableDirs > 0) notes.push(`недоступных папок: ${walk.unreadableDirs}`);
+
+            lines.push("", `Всего: ${entries.length}${notes.length > 0 ? ` (⚠️ ${notes.join("; ")})` : ""}`);
 
             return ok(lines.join("\n"));
         } catch (error) {

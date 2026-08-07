@@ -1,8 +1,8 @@
 import { z } from "zod";
-import { mkdir, stat } from "node:fs/promises";
-import { dirname } from "node:path";
+import { stat } from "node:fs/promises";
 import { defineTool } from "@/tools/types";
 import { audit } from "@/utils/audit";
+import { byteLength, writeFileAtomic } from "@/utils/fs-atomic";
 import { formatBytes } from "@/utils/output";
 import { fail, fromError, okJson } from "@/utils/result";
 import { resolveSandboxed } from "@/utils/sandbox";
@@ -11,7 +11,8 @@ import { createSnapshot } from "@/utils/snapshot";
 export const writeFileTool = defineTool({
     name: "fs_write_file",
     description:
-        "Create or fully overwrite a file. Takes an automatic snapshot of the previous version first (restore via fs_restore). For edits inside an existing file prefer fs_patch_file.",
+        "Create or fully overwrite a file. Takes an automatic snapshot of the previous version first (restore via fs_restore) and writes atomically. For edits inside an existing file prefer fs_patch_file.",
+    annotations: { title: "Write file", readOnlyHint: false, destructiveHint: true },
     schema: {
         path: z.string().describe("Relative or absolute path of the file to write"),
         content: z.string().describe("Full text content to write"),
@@ -39,10 +40,9 @@ export const writeFileTool = defineTool({
 
             const snapshot = existed ? await createSnapshot(target.path, "fs_write_file") : null;
 
-            if (args.createDirs !== false) {
-                await mkdir(dirname(target.path), { recursive: true });
-            }
-            const bytes = await Bun.write(target.path, args.content);
+            // Атомарно: падение посреди записи больше не оставляет обрезанный файл.
+            await writeFileAtomic(target.path, args.content, { createDirs: args.createDirs !== false });
+            const bytes = byteLength(args.content);
 
             await audit({
                 tool: "fs_write_file",
