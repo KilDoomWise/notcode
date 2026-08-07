@@ -4,9 +4,12 @@ import { audit } from "@/utils/audit";
 import { formatDuration } from "@/utils/output";
 import { fail, fromError, ok, okJson } from "@/utils/result";
 import { resolveSandboxed } from "@/utils/sandbox";
-import { terminals, type ShellKind } from "@/utils/terminal-manager";
+import { terminals, type ShellKind, AVAILABLE_SHELLS } from "@/utils/terminal-manager";
 
-const shellEnum = z.enum(["cmd", "powershell", "bash", "sh"]);
+// Список ограничен под текущую ОС сервера — раньше схема всегда показывала все 4 варианта,
+// и модель могла попросить cmd на Linux или bash на Windows без WSL, получая на выходе
+// малопонятную ошибку ENOENT при спавне вместо явного списка того, что реально доступно.
+const shellEnum = z.enum(AVAILABLE_SHELLS as [ShellKind, ...ShellKind[]]);
 
 export const terminalOpenTool = defineTool({
     name: "terminal_open",
@@ -16,7 +19,7 @@ export const terminalOpenTool = defineTool({
     schema: {
         name: z.string().optional().describe("Human-friendly label, e.g. 'build' or 'tests'"),
         cwd: z.string().optional().describe("Starting directory (defaults to workspace root)"),
-        shell: shellEnum.optional().describe("Shell to use (default: cmd on Windows, bash elsewhere)")
+        shell: shellEnum.optional().describe(`Shell to use (default: cmd on Windows, bash elsewhere). Available on this server: ${AVAILABLE_SHELLS.join(", ")}`)
     },
     handler: async (args: { name?: string; cwd?: string; shell?: ShellKind }) => {
         try {

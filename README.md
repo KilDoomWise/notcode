@@ -27,7 +27,7 @@ by Claude & KilDoom
 
 ```bash
 # 1. Клонируем и устанавливаем зависимости
-git clone <адрес-репозитория> notcode
+git clone https://github.com/KilDoomWise/notcode
 cd notcode
 bun install
 

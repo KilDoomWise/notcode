@@ -1,4 +1,4 @@
-import { getWorkspaceRoot, loadConfig } from "@/config";
+import { getWorkspaceRoot, loadConfig, type NotCodeConfig } from "@/config";
 import { Mutex } from "@/utils/lock";
 import { createLogger, errorMessage } from "@/utils/logger";
 import { terminateProcess } from "@/utils/proc";
@@ -19,14 +19,28 @@ const log = createLogger("terminal");
  * навсегда оставалась в статусе running и больше не принимала команд.
  */
 const MARKER_PREFIX = "__NOTCODE_DONE_";
-const MARKER_RE = /__NOTCODE_DONE_([0-9a-zA-Z]+)__(-?\d+)\|?([^\r\n]*)/;
+const MARKER_RE = /__NOTCODE_DONE_([0-9a-zA-Z]+)__(-?\d+)[|~]?([^\r\n]*)/;
 
-/** Сколько держать завершённую сессию, если её никто не читает. */
-const GC_IDLE_MS = 30 * 60_000;
-const GC_INTERVAL_MS = 5 * 60_000;
+/** Сколько держать УЖЕ ЗАВЕРШЁННУЮ сессию, если её никто не читает. */
+const EXITED_TTL_MS = 30 * 60_000;
+/** Дефолты до первого чтения конфига (limits.terminalIdleMs / limits.gcIntervalMs). */
+const DEFAULT_IDLE_MS = 60 * 60_000;
+const DEFAULT_GC_INTERVAL_MS = 5 * 60_000;
+
+/** Команда, оканчивающаяся одиночным `&` — в sh/bash это запуск в фоне, разделитель уже есть. */
+const TRAILING_BACKGROUND_RE = /(^|[^&])&\s*$/;
 
 export type SessionStatus = "idle" | "running" | "exited";
-export type ShellKind = "cmd" | "powershell" | "bash" | "sh";
+
+const ALL_SHELLS = ["cmd", "powershell", "bash", "sh"] as const;
+export type ShellKind = (typeof ALL_SHELLS)[number];
+
+/**
+ * Шеллы, которые реально есть на этой ОС. Схема тула раньше всегда показывала все четыре,
+ * и модель могла попросить cmd на Linux — вместо понятного списка получался ENOENT при спавне.
+ */
+export const AVAILABLE_SHELLS: readonly ShellKind[] =
+    process.platform === "win32" ? (["cmd", "powershell"] as const) : (["bash", "sh"] as const);
 
 export interface SessionInfo {
     id: string;
@@ -101,13 +115,43 @@ function encodingSetupCommand(shell: ShellKind): string | null {
 function markerCommand(shell: ShellKind, token: string): string {
     switch (shell) {
         case "cmd":
-            return `echo ${MARKER_PREFIX}${token}__%ERRORLEVEL%^|%CD%`;
+            /**
+             * `call echo %^ERRORLEVEL%` — трюк с двойным разбором строки. Маркер идёт в ОДНОЙ строке
+             * с командой (см. buildCommandLine), а cmd.exe подставляет %ERRORLEVEL% ещё при разборе строки —
+             * то есть ДО запуска команды. `call` заставляет разобрать аргумент второй раз — уже после
+             * выполнения, поэтому код возврата настоящий (без `call` здесь всегда приходит 0).
+             *
+             * Разделитель — `~`, а не `|`: через ДВА прохода разбора пайп не экранируется надёжно
+             * (проверено: и `^|`, и `^^^|` теряют маркер — cmd уводит вывод в конвейер). В путях Windows `~`
+             * встречается только в 8.3-именах, а MARKER_RE берёт всё после первого разделителя целиком.
+             */
+            return `call echo ${MARKER_PREFIX}${token}__%^ERRORLEVEL%~%^CD%`;
         case "powershell":
             return `Write-Output "${MARKER_PREFIX}${token}__$(if ($LASTEXITCODE -ne $null) { $LASTEXITCODE } elseif ($?) { 0 } else { 1 })|$($PWD.Path)"`;
         case "bash":
         case "sh":
             return `echo "${MARKER_PREFIX}${token}__$?|$PWD"`;
     }
+}
+
+/**
+ * Склеивает команду и маркер в ОДНУ строку stdin.
+ *
+ * Раньше маркер писался отдельной строкой — и любая команда, читающая stdin
+ * (`pause`, `read`, `npm init`, любой интерактивный промпт), съедала эту строку как свой ввод.
+ * Маркер не печатался никогда, сессия навсегда оставалась в статусе running и больше не принимала команд.
+ * В одной строке shell разбирает оба стейтмента заранее, и «съесть» маркер уже нельзя.
+ */
+export function buildCommandLine(shell: ShellKind, command: string, token: string): string {
+    const marker = markerCommand(shell, token);
+    const trimmed = command.trim();
+    if (trimmed.length === 0) return marker;
+
+    // `&` в cmd.exe — «выполнить следующее в любом случае»: ERRORLEVEL к этому моменту уже выставлен.
+    if (shell === "cmd") return `${trimmed} & ${marker}`;
+
+    // Фоновая команда (`... &`) уже содержит разделитель — второй даст syntax error.
+    return TRAILING_BACKGROUND_RE.test(trimmed) ? `${trimmed} ${marker}` : `${trimmed}; ${marker}`;
 }
 
 /** Длина «опасного» хвоста, который может оказаться началом маркера, разорванного между чанками. */
@@ -262,7 +306,7 @@ class TerminalSession {
             this.doneWaiters.push(resolve);
         });
 
-        await this.writeRaw(`${command}${this.eol}${markerCommand(this.shell, token)}${this.eol}`);
+        await this.writeRaw(`${buildCommandLine(this.shell, command, token)}${this.eol}`);
 
         /**
          * Ждём событие, а не крутим `while (...) await Bun.sleep(40)`.
@@ -415,13 +459,14 @@ class TerminalSession {
 class TerminalManager {
     private readonly sessions = new Map<string, TerminalSession>();
     private gcTimer: ReturnType<typeof setInterval> | null = null;
+    private idleMs = DEFAULT_IDLE_MS;
 
     async open(
         options: { cwd?: string; shell?: ShellKind; name?: string; env?: Record<string, string> } = {}
     ): Promise<SessionInfo> {
         const config = await loadConfig();
-        this.gc();
-        this.ensureGcTimer();
+        await this.gc();
+        this.startGc(config);
 
         const alive = [...this.sessions.values()].filter(session => session.status !== "exited");
         if (alive.length >= config.limits.maxSessions) {
@@ -488,28 +533,54 @@ class TerminalManager {
     async closeAll(): Promise<number> {
         const ids = [...this.sessions.keys()];
         await Promise.all(ids.map(id => this.close(id, true).catch(() => undefined)));
-        if (this.gcTimer !== null) {
-            clearInterval(this.gcTimer);
-            this.gcTimer = null;
-        }
+        this.stopGc();
         return ids.length;
     }
 
-    /** Убирает завершённые сессии, которые никто не читал больше 30 минут. */
-    gc(): void {
-        const cutoff = Date.now() - GC_IDLE_MS;
-        for (const [id, session] of this.sessions) {
-            if (session.status === "exited" && session.lastActivityAt < cutoff) {
+    /**
+     * Убирает мусор: завершённые сессии, которых никто не читал, и живые, но давно простаивающие.
+     * Сессию в статусе running не трогаем никогда — там может идти сборка на полчаса.
+     */
+    async gc(): Promise<number> {
+        const now = Date.now();
+        let removed = 0;
+
+        for (const [id, session] of [...this.sessions]) {
+            const idleFor = now - session.lastActivityAt;
+
+            if (session.status === "exited") {
+                if (idleFor > EXITED_TTL_MS) {
+                    this.sessions.delete(id);
+                    removed++;
+                }
+                continue;
+            }
+
+            if (session.status === "idle" && idleFor > this.idleMs) {
+                await session.close(true).catch(() => undefined);
                 this.sessions.delete(id);
+                removed++;
+                log.info("терминал закрыт по простою", { id, idleMinutes: Math.round(idleFor / 60_000) });
             }
         }
+
+        return removed;
     }
 
     /** Раньше gc() вызывался только из open(): если больше не открывать терминалов, мёртвые висели вечно. */
-    private ensureGcTimer(): void {
+    startGc(config: NotCodeConfig): void {
+        this.idleMs = config.limits.terminalIdleMs;
         if (this.gcTimer !== null) return;
-        this.gcTimer = setInterval(() => this.gc(), GC_INTERVAL_MS);
+        this.gcTimer = setInterval(() => {
+            void this.gc().catch(error => log.warn("сбой уборки терминалов", { error: errorMessage(error) }));
+        }, config.limits.gcIntervalMs || DEFAULT_GC_INTERVAL_MS);
         this.gcTimer.unref?.();
+    }
+
+    stopGc(): void {
+        if (this.gcTimer === null) return;
+        clearInterval(this.gcTimer);
+        this.gcTimer = null;
     }
 }
 

@@ -1,5 +1,6 @@
 import { watch, type FSWatcher } from "node:fs";
 import { join } from "node:path";
+import { loadConfig, type NotCodeConfig } from "@/config";
 import { createLogger } from "@/utils/logger";
 
 /**
@@ -10,11 +11,13 @@ import { createLogger } from "@/utils/logger";
 
 const log = createLogger("watch");
 
-/** Больше не нужно никому, а каждый recursive-watcher — это дескрипторы и CPU. */
-const MAX_WATCHERS = 16;
-/** Забытый watcher без poll'ов гаснет сам: раньше они жили до конца жизни процесса. */
-const IDLE_TTL_MS = 60 * 60 * 1000;
-const GC_INTERVAL_MS = 5 * 60 * 1000;
+/**
+ * Дефолты до первого чтения конфига (limits.maxWatchers / limits.watcherIdleMs / limits.gcIntervalMs).
+ * Каждый recursive-watcher — это дескрипторы и CPU, а забытый без poll'ов должен гаснуть сам.
+ */
+const DEFAULT_MAX_WATCHERS = 16;
+const DEFAULT_IDLE_TTL_MS = 30 * 60 * 1000;
+const DEFAULT_GC_INTERVAL_MS = 5 * 60 * 1000;
 const DEBOUNCE_MS = 200;
 
 export interface WatchEvent {
@@ -57,13 +60,18 @@ let watcherCounter = 0;
 class WatchManager {
     private readonly watchers = new Map<string, WatcherState>();
     private gcTimer: ReturnType<typeof setInterval> | null = null;
+    private maxWatchers = DEFAULT_MAX_WATCHERS;
+    private idleTtlMs = DEFAULT_IDLE_TTL_MS;
 
-    start(options: { path: string; recursive?: boolean; maxEvents?: number }): WatcherInfo {
+    async start(options: { path: string; recursive?: boolean; maxEvents?: number }): Promise<WatcherInfo> {
+        const config = await loadConfig();
+        this.maxWatchers = config.limits.maxWatchers;
+        this.idleTtlMs = config.limits.watcherIdleMs;
         this.gc();
 
-        if (this.watchers.size >= MAX_WATCHERS) {
+        if (this.watchers.size >= this.maxWatchers) {
             throw new Error(
-                `Достигнут лимит наблюдателей (${MAX_WATCHERS}). Останови ненужные через fs_watch_stop (список — fs_watch_list).`
+                `Достигнут лимит наблюдателей (${this.maxWatchers}). Останови ненужные через fs_watch_stop (список — fs_watch_list).`
             );
         }
 
@@ -139,7 +147,7 @@ class WatchManager {
         });
 
         this.watchers.set(id, full);
-        this.ensureGcTimer();
+        this.startGc(config);
 
         return this.info(full);
     }
@@ -190,7 +198,7 @@ class WatchManager {
         let removed = 0;
 
         for (const [id, state] of [...this.watchers.entries()]) {
-            const idle = now - state.lastActivity > IDLE_TTL_MS;
+            const idle = now - state.lastActivity > this.idleTtlMs;
             if (!state.error && !idle) continue;
             try {
                 state.watcher.close();
@@ -205,11 +213,17 @@ class WatchManager {
         return removed;
     }
 
-    private ensureGcTimer(): void {
+    startGc(config: NotCodeConfig): void {
+        this.maxWatchers = config.limits.maxWatchers;
+        this.idleTtlMs = config.limits.watcherIdleMs;
         if (this.gcTimer) return;
-        this.gcTimer = setInterval(() => this.gc(), GC_INTERVAL_MS);
+        this.gcTimer = setInterval(() => this.gc(), config.limits.gcIntervalMs || DEFAULT_GC_INTERVAL_MS);
         // Таймер не должен удерживать процесс в живых.
         this.gcTimer.unref?.();
+    }
+
+    stopGc(): void {
+        this.clearGcTimer();
     }
 
     private clearGcTimer(): void {

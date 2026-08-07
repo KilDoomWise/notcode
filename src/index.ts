@@ -14,8 +14,10 @@ import {
     updateConfig,
     type NotCodeConfig
 } from "@/config";
-import { readAudit } from "@/utils/audit";
+import { readAudit, trimAuditLog } from "@/utils/audit";
 import { createLogger, describeError, errorCode, errorMessage } from "@/utils/logger";
+import { formatBytes, formatDuration } from "@/utils/output";
+import { gcSnapshots } from "@/utils/snapshot";
 import { terminals } from "@/utils/terminal-manager";
 import { watchers } from "@/utils/watch-manager";
 
@@ -24,11 +26,16 @@ const log = createLogger("server");
 const SERVER_NAME = "notcode";
 const SERVER_VERSION = "2.0.0";
 
+/** Как часто разрешено писать в лог агрегат по открытым SSE-сессиям. */
+const SSE_LOG_THROTTLE_MS = 2_000;
+
 interface Session {
     id: string;
     transport: SSEServerTransport;
     server: ReturnType<typeof createServer>;
     createdAt: number;
+    /** Последняя активность КЛИЕНТА (POST /messages), а не наш heartbeat. */
+    lastActivityAt: number;
     close(reason: string): Promise<void>;
 }
 
@@ -48,12 +55,40 @@ function safeEqual(a: string, b: string): boolean {
     return diff === 0;
 }
 
-function box(lines: string[]): string {
-    const width = Math.max(...lines.map(line => line.length), 60);
-    const top = `┌${"─".repeat(width + 2)}┐`;
-    const bottom = `└${"─".repeat(width + 2)}┘`;
-    const body = lines.map(line => (line === "-" ? `├${"─".repeat(width + 2)}┤` : `│ ${line.padEnd(width)} │`));
-    return [top, ...body, bottom].join("\n");
+// ─────────────────────────────────────────────────────────────────────────────
+// Вывод в консоль
+// ─────────────────────────────────────────────────────────────────────────────
+
+const useColor = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
+
+function paint(code: string, value: string): string {
+    return useColor ? `\u001b[${code}m${value}\u001b[0m` : value;
+}
+
+const dim = (value: string): string => paint("2", value);
+const bold = (value: string): string => paint("1", value);
+const cyan = (value: string): string => paint("36", value);
+const yellow = (value: string): string => paint("33", value);
+
+const WORDMARK = [
+    "███╗   ██╗ ██████╗ ████████╗ ██████╗ ██████╗ ██████╗ ███████╗",
+    "████╗  ██║██╔═══██╗╚══██╔══╝██╔════╝██╔═══██╗██╔══██╗██╔════╝",
+    "██╔██╗ ██║██║   ██║   ██║   ██║     ██║   ██║██║  ██║█████╗",
+    "██║╚██╗██║██║   ██║   ██║   ██║     ██║   ██║██║  ██║██╔══╝",
+    "██║ ╚████║╚██████╔╝   ██║   ╚██████╗╚██████╔╝██████╔╝███████╗",
+    "╚═╝  ╚═══╝ ╚═════╝    ╚═╝    ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝"
+];
+
+/** Ровный блок «метка — значение». Никаких рамок: они разъезжаются на эмодзи и кириллице. */
+function rows(entries: Array<[string, string]>): string {
+    const width = Math.max(...entries.map(([label]) => label.length));
+    return entries.map(([label, value]) => `  ${dim(label.padEnd(width))}   ${value}`).join("\n");
+}
+
+function wordmark(): string {
+    // Блочные символы требуют UTF-8 и нормального шрифта: в пайпах и CI отдаём простой текст.
+    if (!process.stdout.isTTY) return bold(`${SERVER_NAME.toUpperCase()} v${SERVER_VERSION}`);
+    return WORDMARK.map(line => cyan(line)).join("\n");
 }
 
 /** Адрес, по которому реально можно подключиться: по 0.0.0.0 клиент не ходит. */
@@ -260,23 +295,38 @@ async function runCli(): Promise<void> {
         }
 
         case "status": {
+            console.log("");
+            console.log(`  ${bold(`NotCode v${SERVER_VERSION}`)}  ${dim("—")}  статус`);
+            console.log("");
             console.log(
-                box([
-                    `NOTCODE STATUS`,
-                    "-",
-                    `Режим:            ${config.mode.toUpperCase()}`,
-                    `Воркспейс:        ${config.activeProfile} → ${getWorkspaceRoot(config)}`,
-                    `Разрешено:        ${getProfile(config).allowedPaths.length} доп. папок`,
-                    `Тулов:            ${toolCount()}`,
-                    `Аудит:            ${config.audit.enabled ? "вкл" : "выкл"} (max ${config.audit.maxEntries})`,
-                    `Снапшоты:         ${config.snapshots.enabled ? "вкл" : "выкл"} (${config.snapshots.keepPerFile} на файл)`,
-                    `Адрес:            ${displayHost(config.host)}:${config.port}`,
-                    `Runtime-права:    mode=${config.security.allowRuntimeModeChange ? "on" : "off"}, workspace=${
-                        config.security.allowRuntimeWorkspaceChange ? "on" : "off"
-                    }`,
-                    `Конфиг:           ${CONFIG_FILE}`
+                rows([
+                    ["Режим", config.mode.toUpperCase()],
+                    ["Воркспейс", `${config.activeProfile} → ${getWorkspaceRoot(config)}`],
+                    ["Доп. папки", `${getProfile(config).allowedPaths.length}`],
+                    ["Тулов", `${toolCount()}`],
+                    [
+                        "Аудит",
+                        `${config.audit.enabled ? "вкл" : "выкл"}, до ${config.audit.maxEntries} записей / ${formatBytes(
+                            config.audit.maxFileBytes
+                        )}`
+                    ],
+                    [
+                        "Снапшоты",
+                        `${config.snapshots.enabled ? "вкл" : "выкл"}, ${config.snapshots.keepPerFile} на файл, до ${formatBytes(
+                            config.snapshots.maxTotalBytes
+                        )} всего`
+                    ],
+                    ["Адрес", `${displayHost(config.host)}:${config.port}`],
+                    [
+                        "Runtime-права",
+                        `mode=${config.security.allowRuntimeModeChange ? "on" : "off"}, workspace=${
+                            config.security.allowRuntimeWorkspaceChange ? "on" : "off"
+                        }`
+                    ],
+                    ["Конфиг", CONFIG_FILE]
                 ])
             );
+            console.log("");
             process.exit(0);
             return;
         }
@@ -304,11 +354,111 @@ async function runCli(): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Учёт SSE-сессий
+// ─────────────────────────────────────────────────────────────────────────────
+
+let openedSinceReport = 0;
+let reportTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Клиент открывает НОВЫЙ поток на каждую попытку переподключения. При флаппинге сети
+ * это сотни строк за секунду — в прошлый раз лог получил 313 одинаковых записей за 1.3 с
+ * и в них невозможно было разглядеть настоящие события.
+ *
+ * Поэтому каждая сессия пишется в debug, а в info уходит агрегат не чаще раза в SSE_LOG_THROTTLE_MS.
+ */
+function reportSessionOpened(): void {
+    openedSinceReport++;
+    if (reportTimer !== null) return;
+
+    reportTimer = setTimeout(() => {
+        reportTimer = null;
+        const opened = openedSinceReport;
+        openedSinceReport = 0;
+        log.info(`SSE: +${opened} ${opened === 1 ? "сессия" : "сессий"}, активно ${transports.size}`);
+    }, SSE_LOG_THROTTLE_MS);
+
+    reportTimer.unref?.();
+}
+
+/**
+ * Потолок на число живых сессий. Без него отвалившийся клиент за минуту накапливал сотни
+ * потоков, каждый со своим MCP-сервером и heartbeat-таймером, и сервер отвечал 502.
+ * Вытесняем самые давно неактивные — это и есть мёртвые потоки прошлых переподключений.
+ */
+function enforceSessionCap(limit: number): void {
+    if (transports.size < limit) return;
+
+    const victims = [...transports.values()]
+        .sort((a, b) => a.lastActivityAt - b.lastActivityAt)
+        .slice(0, transports.size - limit + 1);
+
+    for (const victim of victims) {
+        log.warn("лимит SSE-сессий исчерпан, вытесняю самую старую", {
+            sessionId: victim.id,
+            limit,
+            idleFor: formatDuration(Date.now() - victim.lastActivityAt)
+        });
+        void victim.close("вытеснена лимитом sse.maxSessions");
+    }
+}
+
+/** Закрывает сессии, от которых клиент давно ничего не присылал. */
+function sweepSessions(idleMs: number): number {
+    const now = Date.now();
+    let closed = 0;
+
+    for (const session of [...transports.values()]) {
+        if (now - session.lastActivityAt <= idleMs) continue;
+        closed++;
+        void session.close("простой дольше sse.sessionIdleMs");
+    }
+
+    return closed;
+}
+
+/**
+ * Фоновое обслуживание. Всё, что может расти бесконечно, подрезается по таймеру,
+ * а не «когда-нибудь при следующем вызове тула».
+ */
+async function runMaintenance(): Promise<void> {
+    try {
+        const config = await loadConfig();
+
+        const sessionsClosed = sweepSessions(config.sse.sessionIdleMs);
+        const terminalsClosed = await terminals.gc();
+        const watchersStopped = watchers.gc();
+        const snapshots = await gcSnapshots(config);
+        const auditTrim = await trimAuditLog(config);
+
+        if (
+            sessionsClosed > 0 ||
+            terminalsClosed > 0 ||
+            watchersStopped > 0 ||
+            snapshots.removed > 0 ||
+            auditTrim.trimmed
+        ) {
+            log.info("обслуживание", {
+                sessionsClosed,
+                terminalsClosed,
+                watchersStopped,
+                snapshotsRemoved: snapshots.removed,
+                freed: formatBytes(snapshots.freedBytes),
+                auditTrimmed: auditTrim.trimmed
+            });
+        }
+    } catch (error) {
+        log.warn("сбой фонового обслуживания", { error: errorMessage(error) });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // HTTP / SSE
 // ─────────────────────────────────────────────────────────────────────────────
 
 function startServer(config: NotCodeConfig, listen: { port: number; host: string }): void {
     const heartbeatMs = config.sse.heartbeatMs;
+    const maxSessions = config.sse.maxSessions;
 
     const app = new Elysia()
         .onError(({ error, code, set, request }) => {
@@ -332,7 +482,7 @@ function startServer(config: NotCodeConfig, listen: { port: number; host: string
             if (request.method === "OPTIONS") return;
             if (new URL(request.url).pathname === "/health") return;
 
-            // Читаем токен из конфига (кэш 1 с): после `token --reset` не нужен перезапуск.
+            // Читаем токен из конфига (кэш 1 с): после `token --reset` не нужен перезапуск.
             let expected = config.token;
             try {
                 expected = (await loadConfig()).token;
@@ -364,6 +514,7 @@ function startServer(config: NotCodeConfig, listen: { port: number; host: string
             mode: config.mode,
             tools: toolCount(),
             sessions: transports.size,
+            maxSessions,
             terminals: terminals.list().length,
             watchers: watchers.list().length,
             workspaceRoot: getWorkspaceRoot(config),
@@ -377,6 +528,9 @@ function startServer(config: NotCodeConfig, listen: { port: number; host: string
             let teardown: (reason: string) => Promise<void> = async () => undefined;
 
             const encoder = new TextEncoder();
+
+            // Освобождаем место ДО создания нового MCP-сервера, а не после.
+            enforceSessionCap(maxSessions);
 
             const stream = new ReadableStream<Uint8Array>({
                 start(streamController) {
@@ -463,14 +617,16 @@ function startServer(config: NotCodeConfig, listen: { port: number; host: string
                 await transport.close().catch(() => undefined);
                 await server.close().catch(() => undefined);
 
-                log.info("SSE-сессия закрыта", { sessionId, reason, active: transports.size });
+                log.debug("SSE-сессия закрыта", { sessionId, reason, active: transports.size });
             };
 
+            const now = Date.now();
             const session: Session = {
                 id: sessionId,
                 transport,
                 server,
-                createdAt: Date.now(),
+                createdAt: now,
+                lastActivityAt: now,
                 close: teardown
             };
             transports.set(sessionId, session);
@@ -502,7 +658,8 @@ function startServer(config: NotCodeConfig, listen: { port: number; host: string
                 void teardown("клиент оборвал запрос");
             });
 
-            log.info("SSE-сессия открыта", { sessionId, active: transports.size, heartbeatMs });
+            log.debug("SSE-сессия открыта", { sessionId, active: transports.size, heartbeatMs });
+            reportSessionOpened();
 
             return new Response(stream, {
                 status: 200,
@@ -529,6 +686,9 @@ function startServer(config: NotCodeConfig, listen: { port: number; host: string
                     hint: "SSE-соединение закрыто или сервер был перезапущен. Переподключись к /sse."
                 };
             }
+
+            // Живой считается сессия, которой пользуются, а не та, в которую мы шлём heartbeat.
+            session.lastActivityAt = Date.now();
 
             let statusFromTransport: number | null = null;
             let payload: string | undefined;
@@ -585,6 +745,11 @@ function startServer(config: NotCodeConfig, listen: { port: number; host: string
         process.exit(1);
     }
 
+    // Первый прогон — сразу: подрезаем то, что накопилось между запусками.
+    void runMaintenance();
+    const maintenanceTimer = setInterval(() => void runMaintenance(), config.limits.gcIntervalMs);
+    maintenanceTimer.unref?.();
+
     let shuttingDown = false;
 
     const shutdown = async (signal: string): Promise<void> => {
@@ -593,9 +758,13 @@ function startServer(config: NotCodeConfig, listen: { port: number; host: string
 
         console.log(`\n🛑 ${signal}: гасим сессии, терминалы и watcher'ы…`);
 
+        clearInterval(maintenanceTimer);
+        terminals.stopGc();
+        watchers.stopGc();
+
         // Жёсткий дедлайн: зависший дочерний процесс не должен держать сервер вечно.
         const forceExit = setTimeout(() => {
-            log.warn("грациозное завершение не уложилось в 10 с, выходим принудительно");
+            log.warn("грациозное завершение не уложилось в 10 с, выходим принудительно");
             process.exit(1);
         }, 10_000);
 
@@ -634,32 +803,44 @@ function startServer(config: NotCodeConfig, listen: { port: number; host: string
 
     const shown = displayHost(listen.host);
     const baseUrl = `http://${shown}:${listen.port}`;
+    const sseUrl = `${baseUrl}/sse`;
 
+    console.log("");
+    console.log(wordmark());
+    console.log("");
     console.log(
-        box([
-            "🚀 NOTCODE MCP SERVER v2.0 IS RUNNING",
-            "-",
-            `🛡️  Режим:        ${config.mode.toUpperCase()}`,
-            `📁 Воркспейс:    ${config.activeProfile} → ${getWorkspaceRoot(config)}`,
-            `🧰 Тулов:         ${toolCount()} (fs / terminal-сессии / git / meta)`,
-            `🌐 SSE:           ${baseUrl}/sse`,
-            `❤️  Health:        ${baseUrl}/health`,
-            `💓 Heartbeat:     ${heartbeatMs > 0 ? `каждые ${Math.round(heartbeatMs / 1000)} с` : "выключен (!)"}`,
-            `🔌 Слушаем:       ${listen.host}:${listen.port}`,
-            `🔑 Bearer Token:  ${config.token}`,
-            "-",
-            "📌 Подключение MCP-клиента (Notion AI / Claude / Cursor):",
-            "  1. MCP server URL: адрес SSE выше (или HTTPS-адрес твоего реверс-прокси)",
-            "  2. Authentication: Bearer token",
-            `  3. Token: ${config.token}`
+        `  ${bold(`MCP-сервер v${SERVER_VERSION}`)}  ${dim("·")}  режим ${bold(
+            config.mode.toUpperCase()
+        )}  ${dim("·")}  тулов: ${toolCount()} ${dim("(fs, терминал, git, meta)")}`
+    );
+    console.log("");
+    console.log(
+        rows([
+            ["SSE", cyan(sseUrl)],
+            ["Health", `${baseUrl}/health`],
+            ["Токен", config.token],
+            ["Воркспейс", `${config.activeProfile} → ${getWorkspaceRoot(config)}`],
+            ["Слушаем", `${listen.host}:${listen.port}`],
+            [
+                "Сессии",
+                `heartbeat ${heartbeatMs > 0 ? formatDuration(heartbeatMs) : "выключен (!)"}, лимит ${maxSessions}, ` +
+                    `простой ${formatDuration(config.sse.sessionIdleMs)}`
+            ],
+            ["Уборка", `каждые ${formatDuration(config.limits.gcIntervalMs)}: снапшоты, аудит, терминалы, watcher'ы`],
+            ["Конфиг", CONFIG_FILE]
         ])
     );
+    console.log("");
+    console.log(`  ${dim("Подключение клиента (Notion AI / Claude / Cursor)")}`);
+    console.log(rows([["URL", sseUrl], ["Авторизация", "Bearer token"], ["Token", config.token]]));
+    console.log("");
 
     if (listen.host === "0.0.0.0" || listen.host === "::") {
-        console.warn(
-            "⚠️  Сервер слушает все интерфейсы. У него полный доступ к ФС и shell — " +
-                "держи его за реверс-прокси с TLS или вернись на 127.0.0.1."
+        console.log(
+            `  ${yellow("⚠")}  Сервер слушает все интерфейсы, а у него полный доступ к ФС и shell.\n` +
+                `     Держи его за реверс-прокси с TLS или вернись на 127.0.0.1 (--host 127.0.0.1).`
         );
+        console.log("");
     }
 }
 

@@ -49,7 +49,12 @@ export const writeFileTool = defineTool({
                 action: existed ? "overwrite" : "create",
                 target: target.path,
                 ok: true,
-                detail: { bytes, previousBytes, snapshotId: snapshot?.id ?? null }
+                detail: {
+                    bytes,
+                    previousBytes,
+                    snapshotId: snapshot?.meta?.id ?? null,
+                    snapshotSkipped: snapshot?.skipped ?? null
+                }
             });
 
             return okJson(
@@ -58,9 +63,10 @@ export const writeFileTool = defineTool({
                     action: existed ? "overwritten" : "created",
                     bytes,
                     size: formatBytes(bytes),
-                    snapshotId: snapshot?.id ?? null
+                    snapshotId: snapshot?.meta?.id ?? null,
+                    snapshotSkipped: snapshot?.skipped ?? null
                 },
-                existed ? "Файл перезаписан." : "Файл создан."
+                snapshot?.note ? `Файл перезаписан. ${snapshot.note}` : existed ? "Файл перезаписан." : "Файл создан."
             );
         } catch (error) {
             await audit({ tool: "fs_write_file", action: "write", target: args.path, ok: false });

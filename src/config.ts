@@ -33,19 +33,38 @@ export interface WorkspaceProfile {
 export interface AuditSettings {
     enabled: boolean;
     maxEntries: number;
+    /** Потолок размера audit.jsonl: превышен — лог ротируется, не дожидаясь счётчика записей. */
+    maxFileBytes: number;
 }
 
 export interface SnapshotSettings {
     enabled: boolean;
     keepPerFile: number;
+    /** Файлы больше этого размера не снапшотятся: один бинарь или лог иначе съедает весь диск. */
+    maxFileBytes: number;
+    /** Общий потолок папки снапшотов: старые версии сносятся, пока не влезем. */
+    maxTotalBytes: number;
+    /** Снапшоты старше N дней удаляются. */
+    maxAgeDays: number;
+    /** Осиротевшие снапшоты (исходный файл удалён) живут не дольше N часов. */
+    orphanTtlHours: number;
 }
 
 export interface LimitSettings {
     execTimeoutMs: number;
     maxOutputChars: number;
     maxReadChars: number;
+    /** Одновременных терминал-сессий. */
     maxSessions: number;
     sessionBufferChars: number;
+    /** Одновременных fs.watch: каждый держит хендлы ОС и копит события. */
+    maxWatchers: number;
+    /** Watcher без fs_watch_poll дольше этого времени гаснет сам. */
+    watcherIdleMs: number;
+    /** Простаивающая терминал-сессия закрывается сама (running-команды не трогаем). */
+    terminalIdleMs: number;
+    /** Период фонового обслуживания: GC сессий, watcher'ов, снапшотов, ротация аудита. */
+    gcIntervalMs: number;
 }
 
 /**
@@ -65,6 +84,14 @@ export interface SseSettings {
     heartbeatMs: number;
     /** idleTimeout сервера Bun в секундах (максимум 255). */
     idleTimeoutSec: number;
+    /**
+     * Потолок одновременных SSE-сессий. MCP-клиент открывает новый поток на каждую попытку
+     * переподключения; без потолка их набираются сотни, и каждая держит свой MCP-сервер
+     * в памяти. При превышении закрывается самая старая простаивающая сессия.
+     */
+    maxSessions: number;
+    /** SSE-сессия без единого сообщения дольше этого времени закрывается фоновой уборкой. */
+    sessionIdleMs: number;
 }
 
 export interface NotCodeConfig {
@@ -133,14 +160,25 @@ function defaults(): NotCodeConfig {
         host: "127.0.0.1",
         activeProfile: DEFAULT_PROFILE,
         profiles: [{ name: DEFAULT_PROFILE, root: DEFAULT_ROOT, allowedPaths: [] }],
-        audit: { enabled: true, maxEntries: 5000 },
-        snapshots: { enabled: true, keepPerFile: 10 },
+        audit: { enabled: true, maxEntries: 5000, maxFileBytes: 5 * 1024 * 1024 },
+        snapshots: {
+            enabled: true,
+            keepPerFile: 10,
+            maxFileBytes: 10 * 1024 * 1024,
+            maxTotalBytes: 512 * 1024 * 1024,
+            maxAgeDays: 30,
+            orphanTtlHours: 24
+        },
         limits: {
             execTimeoutMs: 120_000,
             maxOutputChars: 60_000,
             maxReadChars: 200_000,
             maxSessions: 12,
-            sessionBufferChars: 400_000
+            sessionBufferChars: 400_000,
+            maxWatchers: 16,
+            watcherIdleMs: 30 * 60_000,
+            terminalIdleMs: 60 * 60_000,
+            gcIntervalMs: 5 * 60_000
         },
         security: {
             allowRuntimeModeChange: false,
@@ -148,7 +186,9 @@ function defaults(): NotCodeConfig {
         },
         sse: {
             heartbeatMs: 15_000,
-            idleTimeoutSec: 255
+            idleTimeoutSec: 255,
+            maxSessions: 32,
+            sessionIdleMs: 30 * 60_000
         }
     };
 }
@@ -214,18 +254,27 @@ function normalize(raw: Record<string, unknown>): NotCodeConfig {
         profiles,
         audit: {
             enabled: bool(audit.enabled, base.audit.enabled),
-            maxEntries: Math.trunc(nonNegative(audit.maxEntries, base.audit.maxEntries))
+            maxEntries: Math.trunc(nonNegative(audit.maxEntries, base.audit.maxEntries)),
+            maxFileBytes: Math.trunc(positive(audit.maxFileBytes, base.audit.maxFileBytes))
         },
         snapshots: {
             enabled: bool(snapshots.enabled, base.snapshots.enabled),
-            keepPerFile: Math.trunc(positive(snapshots.keepPerFile, base.snapshots.keepPerFile))
+            keepPerFile: Math.trunc(positive(snapshots.keepPerFile, base.snapshots.keepPerFile)),
+            maxFileBytes: Math.trunc(positive(snapshots.maxFileBytes, base.snapshots.maxFileBytes)),
+            maxTotalBytes: Math.trunc(positive(snapshots.maxTotalBytes, base.snapshots.maxTotalBytes)),
+            maxAgeDays: positive(snapshots.maxAgeDays, base.snapshots.maxAgeDays),
+            orphanTtlHours: positive(snapshots.orphanTtlHours, base.snapshots.orphanTtlHours)
         },
         limits: {
             execTimeoutMs: positive(limits.execTimeoutMs, base.limits.execTimeoutMs),
             maxOutputChars: positive(limits.maxOutputChars, base.limits.maxOutputChars),
             maxReadChars: positive(limits.maxReadChars, base.limits.maxReadChars),
             maxSessions: positive(limits.maxSessions, base.limits.maxSessions),
-            sessionBufferChars: positive(limits.sessionBufferChars, base.limits.sessionBufferChars)
+            sessionBufferChars: positive(limits.sessionBufferChars, base.limits.sessionBufferChars),
+            maxWatchers: Math.trunc(clamp(positive(limits.maxWatchers, base.limits.maxWatchers), 1, 256)),
+            watcherIdleMs: positive(limits.watcherIdleMs, base.limits.watcherIdleMs),
+            terminalIdleMs: positive(limits.terminalIdleMs, base.limits.terminalIdleMs),
+            gcIntervalMs: positive(limits.gcIntervalMs, base.limits.gcIntervalMs)
         },
         security: {
             allowRuntimeModeChange: bool(security.allowRuntimeModeChange, base.security.allowRuntimeModeChange),
@@ -236,7 +285,9 @@ function normalize(raw: Record<string, unknown>): NotCodeConfig {
         },
         sse: {
             heartbeatMs: clamp(Math.trunc(nonNegative(sse.heartbeatMs, base.sse.heartbeatMs)), 0, 120_000),
-            idleTimeoutSec: clamp(Math.trunc(positive(sse.idleTimeoutSec, base.sse.idleTimeoutSec)), 10, 255)
+            idleTimeoutSec: clamp(Math.trunc(positive(sse.idleTimeoutSec, base.sse.idleTimeoutSec)), 10, 255),
+            maxSessions: Math.trunc(clamp(positive(sse.maxSessions, base.sse.maxSessions), 1, 1_024)),
+            sessionIdleMs: positive(sse.sessionIdleMs, base.sse.sessionIdleMs)
         }
     };
 }
