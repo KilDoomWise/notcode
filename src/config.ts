@@ -1,6 +1,6 @@
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
-import { mkdir } from "node:fs/promises";
+import { mkdir, rename } from "node:fs/promises";
 
 /**
  * Режимы безопасности:
@@ -19,11 +19,21 @@ export interface WorkspaceProfile {
 export interface AuditSettings {
     enabled: boolean;
     maxEntries: number;
+    /** Потолок размера audit.jsonl: превышен — лог ротируется, не дожидаясь счётчика записей. */
+    maxFileBytes: number;
 }
 
 export interface SnapshotSettings {
     enabled: boolean;
     keepPerFile: number;
+    /** Файлы больше этого размера не снапшотятся (иначе один бинарь/лог съедает диск). */
+    maxFileBytes: number;
+    /** Общий потолок папки снапшотов: старые версии сносятся, пока не влезем. */
+    maxTotalBytes: number;
+    /** Снапшоты старше N дней удаляются. */
+    maxAgeDays: number;
+    /** Осиротевшие снапшоты (исходный файл удалён) живут не дольше N часов. */
+    orphanTtlHours: number;
 }
 
 export interface LimitSettings {
@@ -32,6 +42,16 @@ export interface LimitSettings {
     maxReadChars: number;
     maxSessions: number;
     sessionBufferChars: number;
+    /** Сколько одновременных fs.watch разрешено (хендлы ОС не бесплатны). */
+    maxWatchers: number;
+    /** Watcher без fs_watch_poll дольше этого времени останавливается сам. */
+    watcherIdleMs: number;
+    /** Простаивающая терминал-сессия закрывается сама (running-команды не трогаем). */
+    sessionIdleMs: number;
+    /** SSE-сессия (подключение MCP-клиента) без единого сообщения дольше этого времени закрывается и удаляется. */
+    sseSessionIdleMs: number;
+    /** Период фонового обслуживания: GC сессий, watcher'ов, снапшотов, ротация лога. */
+    gcIntervalMs: number;
 }
 
 export interface NotCodeConfig {
@@ -72,14 +92,26 @@ function defaults(): NotCodeConfig {
         host: "0.0.0.0",
         activeProfile: DEFAULT_PROFILE,
         profiles: [{ name: DEFAULT_PROFILE, root: DEFAULT_ROOT, allowedPaths: [] }],
-        audit: { enabled: true, maxEntries: 5000 },
-        snapshots: { enabled: true, keepPerFile: 10 },
+        audit: { enabled: true, maxEntries: 5000, maxFileBytes: 5 * 1024 * 1024 },
+        snapshots: {
+            enabled: true,
+            keepPerFile: 10,
+            maxFileBytes: 10 * 1024 * 1024,
+            maxTotalBytes: 512 * 1024 * 1024,
+            maxAgeDays: 30,
+            orphanTtlHours: 24
+        },
         limits: {
             execTimeoutMs: 120_000,
             maxOutputChars: 60_000,
             maxReadChars: 200_000,
             maxSessions: 12,
-            sessionBufferChars: 400_000
+            sessionBufferChars: 400_000,
+            maxWatchers: 8,
+            watcherIdleMs: 30 * 60_000,
+            sessionIdleMs: 60 * 60_000,
+            sseSessionIdleMs: 24 * 60 * 60_000,
+            gcIntervalMs: 5 * 60_000
         }
     };
 }
@@ -130,18 +162,28 @@ function normalize(raw: Record<string, unknown>): NotCodeConfig {
         profiles,
         audit: {
             enabled: bool(audit.enabled, base.audit.enabled),
-            maxEntries: num(audit.maxEntries, base.audit.maxEntries)
+            maxEntries: num(audit.maxEntries, base.audit.maxEntries),
+            maxFileBytes: num(audit.maxFileBytes, base.audit.maxFileBytes)
         },
         snapshots: {
             enabled: bool(snapshots.enabled, base.snapshots.enabled),
-            keepPerFile: num(snapshots.keepPerFile, base.snapshots.keepPerFile)
+            keepPerFile: num(snapshots.keepPerFile, base.snapshots.keepPerFile),
+            maxFileBytes: num(snapshots.maxFileBytes, base.snapshots.maxFileBytes),
+            maxTotalBytes: num(snapshots.maxTotalBytes, base.snapshots.maxTotalBytes),
+            maxAgeDays: num(snapshots.maxAgeDays, base.snapshots.maxAgeDays),
+            orphanTtlHours: num(snapshots.orphanTtlHours, base.snapshots.orphanTtlHours)
         },
         limits: {
             execTimeoutMs: num(limits.execTimeoutMs, base.limits.execTimeoutMs),
             maxOutputChars: num(limits.maxOutputChars, base.limits.maxOutputChars),
             maxReadChars: num(limits.maxReadChars, base.limits.maxReadChars),
             maxSessions: num(limits.maxSessions, base.limits.maxSessions),
-            sessionBufferChars: num(limits.sessionBufferChars, base.limits.sessionBufferChars)
+            sessionBufferChars: num(limits.sessionBufferChars, base.limits.sessionBufferChars),
+            maxWatchers: num(limits.maxWatchers, base.limits.maxWatchers),
+            watcherIdleMs: num(limits.watcherIdleMs, base.limits.watcherIdleMs),
+            sessionIdleMs: num(limits.sessionIdleMs, base.limits.sessionIdleMs),
+            sseSessionIdleMs: num(limits.sseSessionIdleMs, base.limits.sseSessionIdleMs),
+            gcIntervalMs: num(limits.gcIntervalMs, base.limits.gcIntervalMs)
         }
     };
 }
@@ -175,16 +217,30 @@ export async function loadConfig(options: { force?: boolean } = {}): Promise<Not
 
 export async function saveConfig(config: NotCodeConfig): Promise<void> {
     await ensureConfigDirs();
-    await Bun.write(CONFIG_FILE, JSON.stringify(config, null, 2));
+    // Пишем во временный файл и переименовываем — rename атомарен на той же ФС, так что
+    // параллельный loadConfig() никогда не увидит наполовину записанный JSON, и обрыв
+    // процесса посреди записи не бьёт config.json.
+    const tmpFile = `${CONFIG_FILE}.${process.pid}.${Date.now()}.tmp`;
+    await Bun.write(tmpFile, JSON.stringify(config, null, 2));
+    await rename(tmpFile, CONFIG_FILE);
     cache = { config, at: Date.now() };
 }
 
+/** Сериализует все read-modify-write конфига в одну очередь. Без этого два параллельных
+ *  updateConfig() (например, workspace_allow и notcode_set_mode одновременно) читают один
+ *  и тот же конфиг до того, как первый успеет сохраниться, и один из результатов теряется. */
+let configQueue: Promise<unknown> = Promise.resolve();
+
 /** Атомарно (в рамках процесса) читает, мутирует и сохраняет конфиг. */
-export async function updateConfig(mutator: (config: NotCodeConfig) => void | Promise<void>): Promise<NotCodeConfig> {
-    const config = await loadConfig({ force: true });
-    await mutator(config);
-    await saveConfig(config);
-    return config;
+export function updateConfig(mutator: (config: NotCodeConfig) => void | Promise<void>): Promise<NotCodeConfig> {
+    const run = configQueue.then(async () => {
+        const config = await loadConfig({ force: true });
+        await mutator(config);
+        await saveConfig(config);
+        return config;
+    });
+    configQueue = run.catch(() => undefined);
+    return run;
 }
 
 export function invalidateConfigCache(): void {

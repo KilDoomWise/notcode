@@ -53,7 +53,7 @@ export const restoreTool = defineTool({
                 action: "restore",
                 target: result.restoredTo,
                 ok: true,
-                detail: { snapshotId: args.snapshotId, bytes: result.bytes }
+                detail: { snapshotId: args.snapshotId, bytes: result.bytes, backupId: result.backupId }
             });
 
             return okJson(
@@ -61,9 +61,12 @@ export const restoreTool = defineTool({
                     snapshotId: result.meta.id,
                     restoredTo: result.restoredTo,
                     bytes: result.bytes,
-                    snapshotTakenAt: result.meta.ts
+                    snapshotTakenAt: result.meta.ts,
+                    backupId: result.backupId
                 },
-                "Файл восстановлен из снапшота."
+                result.backupId
+                    ? `Файл восстановлен из снапшота. Предыдущее состояние сохранено как ${result.backupId} — откат отката возможен.`
+                    : "Файл восстановлен из снапшота."
             );
         } catch (error) {
             await audit({ tool: "fs_restore", action: "restore", target: args.snapshotId, ok: false });

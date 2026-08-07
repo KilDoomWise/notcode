@@ -16,7 +16,7 @@ export const watchStartTool = defineTool({
     handler: async (args: { path?: string; recursive?: boolean; maxEvents?: number }) => {
         try {
             const target = await resolveSandboxed(args.path);
-            const info = watchers.start({
+            const info = await watchers.start({
                 path: target.path,
                 recursive: args.recursive,
                 maxEvents: args.maxEvents

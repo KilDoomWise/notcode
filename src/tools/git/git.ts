@@ -1,14 +1,19 @@
 import { z } from "zod";
 import { defineTool } from "@/tools/types";
 import { audit } from "@/utils/audit";
-import { shellQuote } from "@/utils/output";
 import { fail, fromError, ok } from "@/utils/result";
 import { resolveSandboxed } from "@/utils/sandbox";
-import { formatRunResult, runOnce } from "@/utils/shell";
+import { formatRunResult, runArgv } from "@/utils/shell";
 
-async function git(command: string, cwd?: string, timeoutMs = 60_000) {
+/**
+ * Раньше команда шла строкой (`git ${command}`) через runOnce()+shellQuote(), которая не могла
+ * корректно проэкранировать `"` внутри cmd.exe-скрипта (см. utils/output.ts). Здесь аргументы
+ * идут отдельным списком в runArgv() — Bun.spawn сам собирает вызов ОС, так что кавычки, `%`,
+ * `&` и т.п. в сообщении коммита или пути не требуют экранирования вообще.
+ */
+async function git(args: string[], cwd?: string, timeoutMs = 60_000) {
     const target = cwd ? (await resolveSandboxed(cwd)).path : undefined;
-    return runOnce({ command: `git ${command}`, cwd: target, timeoutMs });
+    return runArgv({ argv: ["git", ...args], cwd: target, timeoutMs });
 }
 
 export const gitStatusTool = defineTool({
@@ -19,7 +24,7 @@ export const gitStatusTool = defineTool({
     },
     handler: async (args: { cwd?: string }) => {
         try {
-            const result = await git("status --porcelain=v1 -b", args.cwd);
+            const result = await git(["status", "--porcelain=v1", "-b"], args.cwd);
             if (result.exitCode !== 0) return fail(formatRunResult(result));
 
             const lines = result.stdout.split("\n").filter(line => line.trim().length > 0);
@@ -64,9 +69,9 @@ export const gitDiffTool = defineTool({
             const parts = ["diff"];
             if (args.staged) parts.push("--staged");
             if (args.statOnly) parts.push("--stat");
-            if (args.path) parts.push("--", shellQuote(args.path));
+            if (args.path) parts.push("--", args.path);
 
-            const result = await git(parts.join(" "), args.cwd);
+            const result = await git(parts, args.cwd);
             if (result.exitCode !== 0) return fail(formatRunResult(result));
 
             return ok(result.stdout.trim().length > 0 ? result.stdout : "Изменений нет.");
@@ -88,14 +93,14 @@ export const gitCommitTool = defineTool({
     handler: async (args: { message: string; addAll?: boolean; paths?: string[]; cwd?: string }) => {
         try {
             if (args.addAll) {
-                const add = await git("add -A", args.cwd);
+                const add = await git(["add", "-A"], args.cwd);
                 if (add.exitCode !== 0) return fail(formatRunResult(add));
             } else if (args.paths && args.paths.length > 0) {
-                const add = await git(`add ${args.paths.map(shellQuote).join(" ")}`, args.cwd);
+                const add = await git(["add", ...args.paths], args.cwd);
                 if (add.exitCode !== 0) return fail(formatRunResult(add));
             }
 
-            const result = await git(`commit -m ${shellQuote(args.message)}`, args.cwd);
+            const result = await git(["commit", "-m", args.message], args.cwd);
             await audit({
                 tool: "git_commit",
                 action: "commit",
@@ -106,7 +111,7 @@ export const gitCommitTool = defineTool({
 
             if (result.exitCode !== 0) return fail(formatRunResult(result));
 
-            const hash = await git("rev-parse --short HEAD", args.cwd);
+            const hash = await git(["rev-parse", "--short", "HEAD"], args.cwd);
             return ok(`Коммит создан: ${hash.stdout.trim()}\n\n${result.stdout}`);
         } catch (error) {
             await audit({ tool: "git_commit", action: "commit", target: args.message, ok: false });
@@ -125,10 +130,10 @@ export const gitLogTool = defineTool({
     },
     handler: async (args: { limit?: number; path?: string; cwd?: string }) => {
         try {
-            const parts = [`log --oneline --decorate -n ${args.limit ?? 20}`];
-            if (args.path) parts.push("--", shellQuote(args.path));
+            const parts = ["log", "--oneline", "--decorate", "-n", String(args.limit ?? 20)];
+            if (args.path) parts.push("--", args.path);
 
-            const result = await git(parts.join(" "), args.cwd);
+            const result = await git(parts, args.cwd);
             if (result.exitCode !== 0) return fail(formatRunResult(result));
 
             return ok(result.stdout.trim().length > 0 ? result.stdout : "Коммитов нет.");
@@ -149,18 +154,18 @@ export const gitBranchTool = defineTool({
     handler: async (args: { create?: string; checkout?: string; cwd?: string }) => {
         try {
             if (args.create) {
-                const result = await git(`checkout -b ${shellQuote(args.create)}`, args.cwd);
+                const result = await git(["checkout", "-b", args.create], args.cwd);
                 await audit({ tool: "git_branch", action: "create", target: args.create, ok: result.exitCode === 0 });
                 return result.exitCode === 0 ? ok(formatRunResult(result)) : fail(formatRunResult(result));
             }
 
             if (args.checkout) {
-                const result = await git(`checkout ${shellQuote(args.checkout)}`, args.cwd);
+                const result = await git(["checkout", args.checkout], args.cwd);
                 await audit({ tool: "git_branch", action: "checkout", target: args.checkout, ok: result.exitCode === 0 });
                 return result.exitCode === 0 ? ok(formatRunResult(result)) : fail(formatRunResult(result));
             }
 
-            const result = await git("branch -vv --all", args.cwd);
+            const result = await git(["branch", "-vv", "--all"], args.cwd);
             return result.exitCode === 0 ? ok(result.stdout || "Веток нет.") : fail(formatRunResult(result));
         } catch (error) {
             return fromError("Error running git branch", error);

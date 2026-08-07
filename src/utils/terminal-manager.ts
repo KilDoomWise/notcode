@@ -15,6 +15,11 @@ const MARKER_RE = /__NOTCODE_DONE_([0-9a-zA-Z]+)__(-?\d+)\|?([^\r\n]*)/;
 export type SessionStatus = "idle" | "running" | "exited";
 export type ShellKind = "cmd" | "powershell" | "bash" | "sh";
 
+/** Какие shell-опции вообще имеют смысл на этой ОС — используется схемой terminal_open,
+ *  чтобы вызывающая модель не пыталась открыть cmd на Linux или bash на Windows без WSL. */
+export const AVAILABLE_SHELLS: ShellKind[] =
+    process.platform === "win32" ? ["cmd", "powershell"] : ["bash", "sh", "powershell"];
+
 export interface SessionInfo {
     id: string;
     name: string;
@@ -80,6 +85,48 @@ function markerCommand(shell: ShellKind, token: string): string {
     }
 }
 
+/** Команда явно фонит через POSIX `&` в конце — не можем безопасно приклеить `; marker`
+ *  на ту же строку (`cmd & ; marker` — синтаксическая ошибка bash/sh). Такие команды
+ *  почти не встречаются в этом инструменте (для долгих задач есть waitMs), поэтому для
+ *  них сохраняем старое поведение из двух строк вместо склейки ниже. */
+const TRAILING_BACKGROUND_RE = /&\s*$/;
+
+/**
+ * Раньше run() писал `${command}\n${markerCommand}\n` ДВУМЯ строками одним writeRaw().
+ * Это ломается на любой команде, которая сама читает stdin «сырыми» байтами раньше, чем
+ * shell перейдёт к следующей строке — например `pause` на Windows: если stdin не консоль
+ * (а тут именно пайп), pause не ждёт настоящую консоль, а читает ровно 1 байт напрямую из
+ * пайпа. Раз обе строки уже лежат в пайпе одним чанком (writeRaw пишет их за один вызов),
+ * pause мгновенно — ещё до любого terminal_write — сжирает первый байт ещё НЕ выполненного
+ * маркера, букву "e" из "echo". Shell затем пытается выполнить огрызок "cho ..." как
+ * отдельную команду ("'cho' is not recognized..."), а настоящий маркер с токеном никогда
+ * не печатается — сессия навсегда виснет в status=running. Это НЕ ограничивается pause:
+ * тот же класс бага задевает choice, set /p, запросы пароля sudo/ssh, `python -c
+ * "input()"` и любой другой посимвольный/построчный сырой read из stdin.
+ * Склейка команды и маркера в ОДНУ физическую строку (через `&`/`;`) чинит это: чтобы
+ * распознать оператор-разделитель, shell обязан дочитать всю строку целиком ДО того, как
+ * запустит первую подкоманду — то есть к моменту фактического старта `pause` в пайпе уже
+ * физически не остаётся хвоста, который можно случайно схватить.
+ */
+function buildCommandLine(shell: ShellKind, command: string, token: string, eol: string): string {
+    const marker = markerCommand(shell, token);
+
+    if (shell !== "cmd" && TRAILING_BACKGROUND_RE.test(command)) {
+        return `${command}${eol}${marker}${eol}`;
+    }
+
+    switch (shell) {
+        case "cmd":
+            // `&` — выполнить маркер безусловно, независимо от ERRORLEVEL команды.
+            return `${command} & ${marker}${eol}`;
+        case "powershell":
+        case "bash":
+        case "sh":
+            // `;` — тоже безусловное продолжение (сессии открываются без `set -e`/`-Stop`).
+            return `${command}; ${marker}${eol}`;
+    }
+}
+
 /** Длина «опасного» хвоста, который может оказаться началом маркера, разорванного между чанками. */
 function riskySuffixLength(value: string): number {
     const tail = value.slice(-MARKER_PREFIX.length);
@@ -90,6 +137,104 @@ function riskySuffixLength(value: string): number {
     }
     return 0;
 }
+
+/**
+ * Убивает процесс вместе с детьми.
+ * proc.kill() гасит только сам shell, а запущенные из него bun/vite/node остаются висеть
+ * в памяти и держать порты. На Windows дерево сносит taskkill /T /F, на POSIX — kill по группе процессов.
+ */
+/** Список прямых детей pid через pgrep -P (есть и на Linux, и на macOS из коробки). */
+async function listChildPids(pid: number): Promise<number[]> {
+    try {
+        const lister = Bun.spawn({
+            cmd: ["pgrep", "-P", String(pid)],
+            stdin: "ignore",
+            stdout: "pipe",
+            stderr: "ignore"
+        });
+        const text = await new Response(lister.stdout).text();
+        await lister.exited;
+        return text
+            .split(/\s+/)
+            .map(part => Number.parseInt(part, 10))
+            .filter(value => Number.isInteger(value) && value > 0);
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * Обходит дерево потомков вручную через pgrep -P.
+ * process.kill(-pid, sig) бьёт по группе процессов, но это работает только если shell — лидер
+ * своей группы; Bun.spawn не выставляет detached/setsid, так что группа обычно совпадает
+ * с группой самого notcode-сервера, и process.kill(-pid) либо не находит цели, либо в худшем
+ * случае может задеть не тот процесс. Явный обход дерева через pgrep не зависит от group id.
+ */
+async function collectDescendantPids(rootPid: number): Promise<number[]> {
+    const seen = new Set<number>();
+    let frontier = [rootPid];
+    while (frontier.length > 0) {
+        const next: number[] = [];
+        for (const pid of frontier) {
+            for (const child of await listChildPids(pid)) {
+                if (!seen.has(child)) {
+                    seen.add(child);
+                    next.push(child);
+                }
+            }
+        }
+        frontier = next;
+    }
+    return [...seen];
+}
+
+async function killTree(proc: Bun.Subprocess, force: boolean): Promise<void> {
+    const pid = proc.pid;
+
+    if (typeof pid === "number" && pid > 0) {
+        if (process.platform === "win32") {
+            try {
+                const killer = Bun.spawn({
+                    cmd: ["taskkill", "/PID", String(pid), "/T", "/F"],
+                    stdin: "ignore",
+                    stdout: "ignore",
+                    stderr: "ignore"
+                });
+                await Promise.race([killer.exited, Bun.sleep(3_000)]);
+            } catch {
+                // taskkill недоступен — остаётся обычный kill ниже
+            }
+        } else {
+            const signal = force ? "SIGKILL" : "SIGTERM";
+
+            // Явный обход дерева — основной путь, не зависит от того, лидер ли shell своей группы.
+            const descendants = await collectDescendantPids(pid);
+            for (const child of descendants) {
+                try {
+                    process.kill(child, signal);
+                } catch {
+                    // потомок уже завершился
+                }
+            }
+
+            // group-kill — дополнительная попытка на случай, если группа всё же существует.
+            try {
+                process.kill(-pid, signal);
+            } catch {
+                // группы нет — уже добили потомков выше через pgrep
+            }
+        }
+    }
+
+    try {
+        proc.kill(force ? 9 : 15);
+    } catch {
+        // процесс уже мёртв
+    }
+}
+
+/** Монотонный счётчик: раньше id считался от sessions.size и повторялся после закрытия сессий. */
+let sessionCounter = 0;
 
 class TerminalSession {
     readonly id: string;
@@ -217,7 +362,7 @@ class TerminalSession {
         this.commandStartedAt = Date.now();
         this.lastActivityAt = Date.now();
 
-        this.writeRaw(`${command}${this.eol}${markerCommand(this.shell, token)}${this.eol}`);
+        this.writeRaw(buildCommandLine(this.shell, command, token, this.eol));
 
         const deadline = Date.now() + Math.max(0, waitMs);
         while (this.status === "running" && Date.now() < deadline) {
@@ -254,11 +399,7 @@ class TerminalSession {
             // всё равно убьём ниже
         }
 
-        try {
-            this.proc.kill(force ? 9 : 15);
-        } catch {
-            // процесс уже мёртв
-        }
+        await killTree(this.proc, force);
 
         this.status = "exited";
     }
@@ -346,10 +487,11 @@ class TerminalSession {
 
 class TerminalManager {
     private readonly sessions = new Map<string, TerminalSession>();
+    private gcTimer: ReturnType<typeof setInterval> | null = null;
 
     async open(options: { cwd?: string; shell?: ShellKind; name?: string; env?: Record<string, string> } = {}): Promise<SessionInfo> {
         const config = await loadConfig();
-        this.gc();
+        await this.gc();
 
         const alive = [...this.sessions.values()].filter(session => session.status !== "exited");
         if (alive.length >= config.limits.maxSessions) {
@@ -358,7 +500,7 @@ class TerminalManager {
             );
         }
 
-        const id = `t${(this.sessions.size + 1).toString().padStart(2, "0")}-${crypto.randomUUID().slice(0, 4)}`;
+        const id = `t${(++sessionCounter).toString().padStart(2, "0")}-${crypto.randomUUID().slice(0, 4)}`;
         const session = new TerminalSession({
             id,
             name: options.name ?? id,
@@ -406,14 +548,52 @@ class TerminalManager {
         return ids.length;
     }
 
-    /** Убирает завершённые сессии, которые никто не читал больше 30 минут. */
-    gc(): void {
-        const cutoff = Date.now() - 30 * 60_000;
+    /**
+     * Убирает завершённые сессии и закрывает живые, но простаивающие.
+     * Раньше GC вызывался только внутри open(): если новых терминалов не открывали,
+     * shell-процессы и их буферы жили до перезапуска сервера.
+     */
+    async gc(): Promise<{ removed: number; closed: number }> {
+        const config = await loadConfig();
+        const now = Date.now();
+        const exitedCutoff = now - 30 * 60_000;
+        const idleCutoff = now - config.limits.sessionIdleMs;
+
+        let removed = 0;
+        let closed = 0;
+
         for (const [id, session] of this.sessions) {
-            if (session.status === "exited" && session.lastActivityAt < cutoff) {
+            if (session.status === "exited") {
+                if (session.lastActivityAt < exitedCutoff) {
+                    this.sessions.delete(id);
+                    removed++;
+                }
+                continue;
+            }
+
+            // running не трогаем: там может идти долгая сборка.
+            if (session.status === "idle" && session.lastActivityAt < idleCutoff) {
+                await session.close(true).catch(() => undefined);
                 this.sessions.delete(id);
+                closed++;
+                removed++;
             }
         }
+
+        return { removed, closed };
+    }
+
+    /** Фоновое обслуживание — без него уборка зависит от того, откроют ли новый терминал. */
+    startGc(intervalMs: number): void {
+        if (this.gcTimer) return;
+        this.gcTimer = setInterval(() => void this.gc().catch(() => undefined), Math.max(30_000, intervalMs));
+        this.gcTimer.unref?.();
+    }
+
+    stopGc(): void {
+        if (!this.gcTimer) return;
+        clearInterval(this.gcTimer);
+        this.gcTimer = null;
     }
 }
 

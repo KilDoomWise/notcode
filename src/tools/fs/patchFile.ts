@@ -4,12 +4,16 @@ import { audit } from "@/utils/audit";
 import { fail, fromError, okJson } from "@/utils/result";
 import { resolveSandboxed } from "@/utils/sandbox";
 import { createSnapshot } from "@/utils/snapshot";
+import { formatBytes } from "@/utils/output";
 
 interface Edit {
     oldStr: string;
     newStr: string;
     replaceAll?: boolean;
 }
+
+/** Патч держит в памяти и оригинал, и результат — на огромном файле это гарантированный OOM. */
+const MAX_PATCH_BYTES = 16 * 1024 * 1024;
 
 function countOccurrences(haystack: string, needle: string): number {
     if (needle.length === 0) return 0;
@@ -49,6 +53,13 @@ export const patchFileTool = defineTool({
                 return fail(`Файл не найден: ${target.path}. Создай его через fs_write_file.`);
             }
 
+            if (file.size > MAX_PATCH_BYTES) {
+                return fail(
+                    `Файл слишком большой для fs_patch_file: ${formatBytes(file.size)} > ${formatBytes(MAX_PATCH_BYTES)}. ` +
+                        `Обработай его потоково через terminal_exec (sed / PowerShell) или работай с нужным фрагментом отдельно.`
+                );
+            }
+
             const original = await file.text();
             let updated = original;
             const applied: Array<{ index: number; replacements: number; chars: number }> = [];
@@ -75,7 +86,7 @@ export const patchFileTool = defineTool({
 
                 updated = edit.replaceAll
                     ? updated.split(edit.oldStr).join(edit.newStr)
-                    : updated.replace(edit.oldStr, edit.newStr);
+                    : updated.replace(edit.oldStr, () => edit.newStr);
 
                 applied.push({
                     index: i + 1,
@@ -109,7 +120,7 @@ export const patchFileTool = defineTool({
                 action: "patch",
                 target: target.path,
                 ok: true,
-                detail: { edits: applied, snapshotId: snapshot?.id ?? null }
+                detail: { edits: applied, snapshotId: snapshot.meta?.id ?? null, snapshotSkipped: snapshot.skipped }
             });
 
             return okJson(
@@ -119,9 +130,10 @@ export const patchFileTool = defineTool({
                     edits: applied,
                     charsBefore: original.length,
                     charsAfter: updated.length,
-                    snapshotId: snapshot?.id ?? null
+                    snapshotId: snapshot.meta?.id ?? null,
+                    snapshotSkipped: snapshot.skipped
                 },
-                "Правки применены."
+                snapshot.note ? `Правки применены. ${snapshot.note}` : "Правки применены."
             );
         } catch (error) {
             await audit({ tool: "fs_patch_file", action: "patch", target: args.path, ok: false });

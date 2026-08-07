@@ -17,6 +17,13 @@ export const searchContentTool = defineTool({
         path: z.string().optional().describe("Directory to search in (defaults to workspace root)"),
         isRegex: z.boolean().optional().describe("Treat query as a regular expression"),
         caseSensitive: z.boolean().optional().describe("Case-sensitive match (default false)"),
+        mode: z
+            .enum(["line", "multiline"])
+            .optional()
+            .describe(
+                "'line' (default): fast per-line grep, one reported match per line, cannot match patterns spanning multiple lines. " +
+                    "'multiline': scans whole file content so isRegex patterns containing \\n (or matching across line breaks) are found too; slower, use it only when 'line' mode returns 0 matches for a pattern that should span lines."
+            ),
         include: z.array(z.string()).optional().describe("Only search files matching these globs, e.g. [\"*.ts\", \"src/**/*.tsx\"]"),
         exclude: z.array(z.string()).optional().describe("Skip files matching these globs"),
         contextLines: z.number().int().min(0).max(5).optional().describe("Lines of context around each match"),
@@ -28,6 +35,7 @@ export const searchContentTool = defineTool({
         path?: string;
         isRegex?: boolean;
         caseSensitive?: boolean;
+        mode?: "line" | "multiline";
         include?: string[];
         exclude?: string[];
         contextLines?: number;
@@ -38,6 +46,7 @@ export const searchContentTool = defineTool({
             const target = await resolveSandboxed(args.path);
             const maxResults = args.maxResults ?? 100;
             const contextLines = args.contextLines ?? 0;
+            const mode = args.mode ?? "line";
 
             const flags = args.caseSensitive ? "g" : "gi";
             const pattern = args.isRegex
@@ -85,6 +94,36 @@ export const searchContentTool = defineTool({
                 if (!pattern.test(content)) continue;
 
                 const fileLines = content.split(/\r?\n/);
+
+                if (mode === "multiline") {
+                    pattern.lastIndex = 0;
+                    let match: RegExpExecArray | null;
+                    while (matches < maxResults && (match = pattern.exec(content))) {
+                        const startLine = content.slice(0, match.index).split(/\r?\n/).length;
+                        const endLine = startLine + match[0].split(/\r?\n/).length - 1;
+
+                        if (currentFile !== entry.relPath) {
+                            if (currentFile) lines.push("");
+                            lines.push(`--- ${entry.relPath}`);
+                            currentFile = entry.relPath;
+                        }
+
+                        for (let ctx = Math.max(1, startLine - contextLines); ctx < startLine; ctx++) {
+                            lines.push(`  ${ctx}│ ${fileLines[ctx - 1]}`);
+                        }
+                        const matchedText = match[0].length > 500 ? `${match[0].slice(0, 500)}…` : match[0];
+                        lines.push(`> ${startLine}-${endLine}│ ${matchedText.replace(/\r?\n/g, "\\n")}`);
+                        for (let ctx = endLine + 1; ctx <= Math.min(fileLines.length, endLine + contextLines); ctx++) {
+                            lines.push(`  ${ctx}│ ${fileLines[ctx - 1]}`);
+                        }
+
+                        matches++;
+                        // Совпадение нулевой длины не двигает lastIndex само — иначе бесконечный цикл.
+                        if (match[0].length === 0) pattern.lastIndex++;
+                    }
+                    continue;
+                }
+
                 for (let i = 0; i < fileLines.length && matches < maxResults; i++) {
                     const line = fileLines[i] as string;
                     pattern.lastIndex = 0;
@@ -108,9 +147,13 @@ export const searchContentTool = defineTool({
                 }
             }
 
-            const header = `Поиск '${args.query}' в ${target.path} — найдено ${matches} совпадений (просмотрено файлов: ${scannedFiles})${matches >= maxResults ? ", лимит достигнут" : ""}`;
+            const header = `Поиск '${args.query}' (mode: ${mode}) в ${target.path} — найдено ${matches} совпадений (просмотрено файлов: ${scannedFiles})${matches >= maxResults ? ", лимит достигнут" : ""}`;
+            const multilineHint =
+                mode === "line" && args.isRegex
+                    ? ' Если паттерн должен матчить несколько строк (содержит "\\n" или использует dotAll/(?s)), повтори поиск с mode: "multiline".'
+                    : "";
 
-            return ok(matches === 0 ? `${header}\nНичего не найдено.` : `${header}\n\n${lines.join("\n")}`);
+            return ok(matches === 0 ? `${header}\nНичего не найдено.${multilineHint}` : `${header}\n\n${lines.join("\n")}`);
         } catch (error) {
             return fromError("Error searching content", error);
         }
