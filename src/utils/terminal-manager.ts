@@ -1,4 +1,9 @@
 import { getWorkspaceRoot, loadConfig } from "@/config";
+import { Mutex } from "@/utils/lock";
+import { createLogger, errorMessage } from "@/utils/logger";
+import { terminateProcess } from "@/utils/proc";
+
+const log = createLogger("terminal");
 
 /**
  * Менеджер долгоживущих терминал-сессий.
@@ -8,9 +13,17 @@ import { getWorkspaceRoot, loadConfig } from "@/config";
  *   __NOTCODE_DONE_<token>__<exitCode>|<cwd>
  * Маркер вырезается из видимого вывода, а из него же берём exit code и актуальный cwd
  * (то есть `cd` внутри сессии сохраняется между командами — в отличие от одноразового exec).
+ *
+ * Критично: stdout и stderr буферизуются ОТДЕЛЬНО. Раньше оба потока писали в одно
+ * поле `pending`, чанки чередовались и маркер мог быть разорван чужим байтом — тогда сессия
+ * навсегда оставалась в статусе running и больше не принимала команд.
  */
 const MARKER_PREFIX = "__NOTCODE_DONE_";
 const MARKER_RE = /__NOTCODE_DONE_([0-9a-zA-Z]+)__(-?\d+)\|?([^\r\n]*)/;
+
+/** Сколько держать завершённую сессию, если её никто не читает. */
+const GC_IDLE_MS = 30 * 60_000;
+const GC_INTERVAL_MS = 5 * 60_000;
 
 export type SessionStatus = "idle" | "running" | "exited";
 export type ShellKind = "cmd" | "powershell" | "bash" | "sh";
@@ -68,6 +81,23 @@ function shellArgv(shell: ShellKind): string[] {
     }
 }
 
+/**
+ * Команда перевода сессии в UTF-8.
+ * Без неё cmd.exe на русской Windows пишет в cp866, а мы декодируем как UTF-8 —
+ * любой русский вывод превращался в кракозябры.
+ */
+function encodingSetupCommand(shell: ShellKind): string | null {
+    switch (shell) {
+        case "cmd":
+            return "chcp 65001>nul";
+        case "powershell":
+            return "$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)";
+        case "bash":
+        case "sh":
+            return null;
+    }
+}
+
 function markerCommand(shell: ShellKind, token: string): string {
     switch (shell) {
         case "cmd":
@@ -91,6 +121,8 @@ function riskySuffixLength(value: string): number {
     return 0;
 }
 
+let sessionCounter = 0;
+
 class TerminalSession {
     readonly id: string;
     readonly name: string;
@@ -107,11 +139,16 @@ class TerminalSession {
     private readonly proc: Bun.Subprocess<"pipe", "pipe", "pipe">;
     private readonly maxBufferChars: number;
     private readonly eol: string;
+    private readonly stdinQueue = new Mutex();
+
     private buffer = "";
     private bufferStart = 0;
-    private pending = "";
+    /** Отдельные незавершённые строки на каждый поток — иначе они склеиваются и ломают маркер. */
+    private pendingOut = "";
+    private pendingErr = "";
     private token: string | null = null;
     private commandStartedAt: number | null = null;
+    private doneWaiters: Array<() => void> = [];
 
     constructor(options: {
         id: string;
@@ -119,7 +156,7 @@ class TerminalSession {
         shell: ShellKind;
         cwd: string;
         maxBufferChars: number;
-        env?: Record<string, string>;
+        env?: Record<string, string> | undefined;
     }) {
         this.id = options.id;
         this.name = options.name;
@@ -137,13 +174,15 @@ class TerminalSession {
             env: { ...process.env, ...options.env }
         }) as Bun.Subprocess<"pipe", "pipe", "pipe">;
 
-        this.pump(this.proc.stdout as ReadableStream<Uint8Array>);
-        this.pump(this.proc.stderr as ReadableStream<Uint8Array>);
+        this.pump(this.proc.stdout as ReadableStream<Uint8Array>, true);
+        this.pump(this.proc.stderr as ReadableStream<Uint8Array>, false);
 
         void this.proc.exited.then(code => {
             this.status = "exited";
             this.shellExitCode = typeof code === "number" ? code : null;
             this.lastActivityAt = Date.now();
+            // Кто ждёт завершения команды — не должен висеть до таймаута, если shell умер.
+            this.signalDone();
         });
     }
 
@@ -167,14 +206,15 @@ class TerminalSession {
             lastCommand: this.lastCommand,
             lastExitCode: this.lastExitCode,
             shellExitCode: this.shellExitCode,
-            runningForMs: this.status === "running" && this.commandStartedAt ? Date.now() - this.commandStartedAt : null,
+            runningForMs:
+                this.status === "running" && this.commandStartedAt !== null ? Date.now() - this.commandStartedAt : null,
             bufferedChars: this.bufferedChars,
             cursor: this.cursor
         };
     }
 
     /** Читает буфер начиная с курсора (или последние tail символов). */
-    read(options: { since?: number; maxChars?: number; tail?: number } = {}): ReadResult {
+    read(options: { since?: number | undefined; maxChars?: number | undefined; tail?: number | undefined } = {}): ReadResult {
         const from = options.since === undefined ? this.bufferStart : Math.max(options.since, this.bufferStart);
         const droppedChars =
             options.since !== undefined && options.since < this.bufferStart ? this.bufferStart - options.since : 0;
@@ -191,9 +231,9 @@ class TerminalSession {
     }
 
     /** Сырой stdin — для интерактивных программ (ответы на промпты, y/n, пароли). */
-    write(input: string, appendNewline = true): void {
+    async write(input: string, appendNewline = true): Promise<void> {
         this.assertAlive();
-        this.writeRaw(appendNewline ? `${input}${this.eol}` : input);
+        await this.writeRaw(appendNewline ? `${input}${this.eol}` : input);
         this.lastActivityAt = Date.now();
     }
 
@@ -217,11 +257,19 @@ class TerminalSession {
         this.commandStartedAt = Date.now();
         this.lastActivityAt = Date.now();
 
-        this.writeRaw(`${command}${this.eol}${markerCommand(this.shell, token)}${this.eol}`);
+        // Подписываемся ДО записи: быстрая команда может завершиться раньше, чем мы начнём ждать.
+        const completed = new Promise<void>(resolve => {
+            this.doneWaiters.push(resolve);
+        });
 
-        const deadline = Date.now() + Math.max(0, waitMs);
-        while (this.status === "running" && Date.now() < deadline) {
-            await Bun.sleep(40);
+        await this.writeRaw(`${command}${this.eol}${markerCommand(this.shell, token)}${this.eol}`);
+
+        /**
+         * Ждём событие, а не крутим `while (...) await Bun.sleep(40)`.
+         * Старый busy-wait на десятиминутной команде давал 15 000 бесполезных итераций.
+         */
+        if (waitMs > 0) {
+            await Promise.race([completed, Bun.sleep(waitMs)]);
         }
 
         const elapsedMs = Date.now() - (this.commandStartedAt ?? Date.now());
@@ -247,20 +295,25 @@ class TerminalSession {
     async close(force = false): Promise<void> {
         try {
             if (!force && this.status !== "exited") {
-                this.writeRaw(`exit${this.eol}`);
+                await this.writeRaw(`exit${this.eol}`);
                 await Promise.race([this.proc.exited, Bun.sleep(600)]);
             }
         } catch {
             // всё равно убьём ниже
         }
 
-        try {
-            this.proc.kill(force ? 9 : 15);
-        } catch {
-            // процесс уже мёртв
-        }
+        // Гасим всё дерево: раньше proc.kill() убивал только shell, а dev-серверы,
+        // запущенные внутри сессии, оставались висеть и держать порты.
+        await terminateProcess(this.proc, { graceMs: force ? 0 : 800 });
 
         this.status = "exited";
+        this.signalDone();
+    }
+
+    private signalDone(): void {
+        const waiters = this.doneWaiters;
+        this.doneWaiters = [];
+        for (const resolve of waiters) resolve();
     }
 
     private assertAlive(): void {
@@ -271,49 +324,63 @@ class TerminalSession {
         }
     }
 
-    private writeRaw(chunk: string): void {
-        const stdin = this.proc.stdin as Bun.FileSink;
-        stdin.write(chunk);
-        void stdin.flush();
+    /** Записи в stdin сериализованы и дожидаются flush: иначе быстрые write подряд перемешиваются. */
+    private writeRaw(chunk: string): Promise<void> {
+        return this.stdinQueue.run(async () => {
+            const stdin = this.proc.stdin as Bun.FileSink;
+            stdin.write(chunk);
+            await stdin.flush();
+        });
     }
 
-    private pump(stream: ReadableStream<Uint8Array>): void {
+    private pump(stream: ReadableStream<Uint8Array>, isStdout: boolean): void {
         const reader = stream.getReader();
         const decoder = new TextDecoder();
 
         void (async () => {
             try {
-                while (true) {
+                for (;;) {
                     const { done, value } = await reader.read();
                     if (done) break;
-                    if (value) this.ingest(decoder.decode(value, { stream: true }));
+                    if (value) this.ingest(decoder.decode(value, { stream: true }), isStdout);
                 }
-            } catch {
-                // стрим закрылся вместе с процессом
+            } catch (error) {
+                log.debug("поток сессии закрылся", { id: this.id, error: errorMessage(error) });
+            } finally {
+                reader.releaseLock();
             }
         })();
     }
 
     /** Разбирает поток на строки, вырезает маркеры, остальное кладёт в буфер. */
-    private ingest(chunk: string): void {
-        this.pending += chunk;
+    private ingest(chunk: string, isStdout: boolean): void {
         this.lastActivityAt = Date.now();
 
-        let newlineIndex = this.pending.indexOf("\n");
+        let pending = (isStdout ? this.pendingOut : this.pendingErr) + chunk;
+
+        let newlineIndex = pending.indexOf("\n");
         while (newlineIndex >= 0) {
-            const line = this.pending.slice(0, newlineIndex + 1);
-            this.pending = this.pending.slice(newlineIndex + 1);
-            this.append(this.processLine(line));
-            newlineIndex = this.pending.indexOf("\n");
+            const line = pending.slice(0, newlineIndex + 1);
+            pending = pending.slice(newlineIndex + 1);
+            // Маркер печатает echo/Write-Output — только stdout. В stderr его искать не надо.
+            this.append(isStdout ? this.processLine(line) : line);
+            newlineIndex = pending.indexOf("\n");
         }
 
         // Незавершённую строку отдаём сразу (прогресс-бары), кроме возможного начала маркера.
-        const hold = riskySuffixLength(this.pending);
-        if (hold < this.pending.length && !this.pending.includes(MARKER_PREFIX)) {
-            const emit = this.pending.slice(0, this.pending.length - hold);
-            this.pending = this.pending.slice(this.pending.length - hold);
-            this.append(emit);
+        if (isStdout) {
+            const hold = riskySuffixLength(pending);
+            if (hold < pending.length && !pending.includes(MARKER_PREFIX)) {
+                this.append(pending.slice(0, pending.length - hold));
+                pending = pending.slice(pending.length - hold);
+            }
+        } else if (pending.length > 0) {
+            this.append(pending);
+            pending = "";
         }
+
+        if (isStdout) this.pendingOut = pending;
+        else this.pendingErr = pending;
     }
 
     private processLine(line: string): string {
@@ -322,11 +389,12 @@ class TerminalSession {
 
         const [, token, exitCode, cwd] = match;
         if (token === this.token) {
-            this.lastExitCode = Number.parseInt(exitCode as string, 10);
+            this.lastExitCode = Number.parseInt(exitCode ?? "0", 10);
             this.status = "idle";
             this.token = null;
             const trimmedCwd = (cwd ?? "").trim();
             if (trimmedCwd.length > 0) this.cwd = trimmedCwd;
+            this.signalDone();
         }
 
         // Строку с маркером не показываем; остальную часть строки — показываем.
@@ -346,10 +414,14 @@ class TerminalSession {
 
 class TerminalManager {
     private readonly sessions = new Map<string, TerminalSession>();
+    private gcTimer: ReturnType<typeof setInterval> | null = null;
 
-    async open(options: { cwd?: string; shell?: ShellKind; name?: string; env?: Record<string, string> } = {}): Promise<SessionInfo> {
+    async open(
+        options: { cwd?: string; shell?: ShellKind; name?: string; env?: Record<string, string> } = {}
+    ): Promise<SessionInfo> {
         const config = await loadConfig();
         this.gc();
+        this.ensureGcTimer();
 
         const alive = [...this.sessions.values()].filter(session => session.status !== "exited");
         if (alive.length >= config.limits.maxSessions) {
@@ -358,11 +430,14 @@ class TerminalManager {
             );
         }
 
-        const id = `t${(this.sessions.size + 1).toString().padStart(2, "0")}-${crypto.randomUUID().slice(0, 4)}`;
+        // Монотонный счётчик: sessions.size после закрытия сессий давал повторяющиеся id.
+        const id = `t${(++sessionCounter).toString().padStart(2, "0")}-${crypto.randomUUID().slice(0, 4)}`;
+        const shell = options.shell ?? defaultShell();
+
         const session = new TerminalSession({
             id,
             name: options.name ?? id,
-            shell: options.shell ?? defaultShell(),
+            shell,
             cwd: options.cwd ?? getWorkspaceRoot(config),
             maxBufferChars: config.limits.sessionBufferChars,
             env: options.env
@@ -370,9 +445,18 @@ class TerminalManager {
 
         this.sessions.set(id, session);
 
+        const setup = encodingSetupCommand(shell);
+        if (setup) {
+            await session.write(setup).catch(error => {
+                log.warn("не удалось перевести сессию в UTF-8", { id, error: errorMessage(error) });
+            });
+        }
+
         // Даём shell выплюнуть баннер/приветствие и чистим буфер.
         await Bun.sleep(250);
         session.clear();
+
+        log.info("терминал открыт", { id, shell, cwd: session.cwd });
 
         return session.info();
     }
@@ -397,23 +481,35 @@ class TerminalManager {
         await session.close(force);
         const info = session.info();
         this.sessions.delete(id);
+        log.info("терминал закрыт", { id, force });
         return info;
     }
 
     async closeAll(): Promise<number> {
         const ids = [...this.sessions.keys()];
         await Promise.all(ids.map(id => this.close(id, true).catch(() => undefined)));
+        if (this.gcTimer !== null) {
+            clearInterval(this.gcTimer);
+            this.gcTimer = null;
+        }
         return ids.length;
     }
 
     /** Убирает завершённые сессии, которые никто не читал больше 30 минут. */
     gc(): void {
-        const cutoff = Date.now() - 30 * 60_000;
+        const cutoff = Date.now() - GC_IDLE_MS;
         for (const [id, session] of this.sessions) {
             if (session.status === "exited" && session.lastActivityAt < cutoff) {
                 this.sessions.delete(id);
             }
         }
+    }
+
+    /** Раньше gc() вызывался только из open(): если больше не открывать терминалов, мёртвые висели вечно. */
+    private ensureGcTimer(): void {
+        if (this.gcTimer !== null) return;
+        this.gcTimer = setInterval(() => this.gc(), GC_INTERVAL_MS);
+        this.gcTimer.unref?.();
     }
 }
 

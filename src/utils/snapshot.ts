@@ -1,10 +1,19 @@
-import { appendFile, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, readFile, rm } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { ensureConfigDirs, loadConfig, SNAPSHOT_DIR, SNAPSHOT_INDEX } from "@/config";
+import { writeFileAtomic } from "@/utils/fs-atomic";
+import { Mutex } from "@/utils/lock";
+import { createLogger, errorMessage } from "@/utils/logger";
+
+const log = createLogger("snapshot");
 
 /**
  * Снапшоты: перед каждой перезаписью/патчем файла кладём копию в ~/.notcode/snapshots.
  * Это страховка для bypass-режима — агент работает без подтверждений, но откат всегда возможен.
+ *
+ * Все операции с индексом идут через мьютекс: без этого два параллельных fs_write_file
+ * делали read-modify-write index.jsonl и теряли записи друг друга:
+ * снапшот лежал на диске, а восстановиться по нему было нельзя.
  */
 export interface SnapshotMeta {
     id: string;
@@ -15,11 +24,24 @@ export interface SnapshotMeta {
     reason: string;
 }
 
+const indexMutex = new Mutex();
+
 function sanitize(name: string): string {
     return name.replace(/[^\w.-]+/g, "_").slice(-80);
 }
 
-async function readIndex(): Promise<SnapshotMeta[]> {
+/** На Windows пути регистронезависимы, на POSIX — нет. Глобальный toLowerCase() склеивал File.txt и file.txt. */
+const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
+
+function pathKey(value: string): string {
+    return caseInsensitive ? value.toLowerCase() : value;
+}
+
+function samePath(a: string, b: string): boolean {
+    return pathKey(a) === pathKey(b);
+}
+
+async function readIndexUnlocked(): Promise<SnapshotMeta[]> {
     try {
         const raw = await readFile(SNAPSHOT_INDEX, "utf8");
         const items: SnapshotMeta[] = [];
@@ -37,9 +59,9 @@ async function readIndex(): Promise<SnapshotMeta[]> {
     }
 }
 
-async function writeIndex(items: SnapshotMeta[]): Promise<void> {
+async function writeIndexUnlocked(items: SnapshotMeta[]): Promise<void> {
     const body = items.map(item => JSON.stringify(item)).join("\n");
-    await writeFile(SNAPSHOT_INDEX, body.length > 0 ? `${body}\n` : "", "utf8");
+    await writeFileAtomic(SNAPSHOT_INDEX, body.length > 0 ? `${body}\n` : "");
 }
 
 /** Создаёт снапшот существующего файла. Возвращает null, если файла нет или снапшоты отключены. */
@@ -65,26 +87,37 @@ export async function createSnapshot(absPath: string, reason: string): Promise<S
         reason
     };
 
-    await appendFile(SNAPSHOT_INDEX, `${JSON.stringify(meta)}\n`, "utf8");
-    await prune(absPath, config.snapshots.keepPerFile);
+    await indexMutex.run(async () => {
+        await appendFile(SNAPSHOT_INDEX, `${JSON.stringify(meta)}\n`, "utf8");
+        await pruneUnlocked(absPath, config.snapshots.keepPerFile);
+    });
 
     return meta;
 }
 
 export async function listSnapshots(options: { path?: string; limit?: number } = {}): Promise<SnapshotMeta[]> {
-    const items = await readIndex();
-    const filtered = options.path
-        ? items.filter(item => item.originalPath.toLowerCase() === options.path!.toLowerCase())
-        : items;
+    const items = await indexMutex.run(() => readIndexUnlocked());
+    const target = options.path;
+    const filtered = target ? items.filter(item => samePath(item.originalPath, target)) : items;
     return filtered.slice(-(options.limit ?? 30)).reverse();
 }
 
-export async function restoreSnapshot(
-    id: string,
-    toPath?: string
-): Promise<{ meta: SnapshotMeta; restoredTo: string; bytes: number }> {
-    const items = await readIndex();
-    const meta = items.find(item => item.id === id);
+/** Находит метаданные снапшота. Нужен тулам, чтобы проверить сандбокс ДО восстановления. */
+export async function findSnapshot(id: string): Promise<SnapshotMeta | null> {
+    const items = await indexMutex.run(() => readIndexUnlocked());
+    return items.find(item => item.id === id) ?? null;
+}
+
+export interface RestoreResult {
+    meta: SnapshotMeta;
+    restoredTo: string;
+    bytes: number;
+    /** Снапшот того, что было на месте до восстановления — чтобы откат тоже можно было откатить. */
+    backupId: string | null;
+}
+
+export async function restoreSnapshot(id: string, toPath?: string): Promise<RestoreResult> {
+    const meta = await findSnapshot(id);
     if (!meta) {
         throw new Error(`Снапшот '${id}' не найден. Список: fs_snapshots`);
     }
@@ -95,19 +128,31 @@ export async function restoreSnapshot(
     }
 
     const restoredTo = toPath ?? meta.originalPath;
-    const bytes = await Bun.write(restoredTo, snapshot);
-    return { meta, restoredTo, bytes };
+
+    // Восстановление — такая же деструктивная операция, как запись. Раньше она была необратимой.
+    const backup = await createSnapshot(restoredTo, `fs_restore:before(${id})`);
+
+    const bytes = await snapshot.arrayBuffer();
+    await writeFileAtomic(restoredTo, new Uint8Array(bytes));
+
+    log.info("снапшот восстановлен", { id, restoredTo, backupId: backup?.id ?? null });
+
+    return { meta, restoredTo, bytes: bytes.byteLength, backupId: backup?.id ?? null };
 }
 
-/** Оставляет только N последних снапшотов на файл, остальные удаляет с диска и из индекса. */
-async function prune(absPath: string, keep: number): Promise<void> {
-    const items = await readIndex();
-    const forPath = items.filter(item => item.originalPath.toLowerCase() === absPath.toLowerCase());
-    if (forPath.length <= keep) return;
+/** Оставляет только N последних снапшотов на файл. Вызывается только внутри indexMutex. */
+async function pruneUnlocked(absPath: string, keep: number): Promise<void> {
+    try {
+        const items = await readIndexUnlocked();
+        const forPath = items.filter(item => samePath(item.originalPath, absPath));
+        if (forPath.length <= keep) return;
 
-    const stale = forPath.slice(0, forPath.length - keep);
-    const staleIds = new Set(stale.map(item => item.id));
+        const stale = forPath.slice(0, forPath.length - keep);
+        const staleIds = new Set(stale.map(item => item.id));
 
-    await Promise.all(stale.map(item => rm(item.snapshotPath, { force: true })));
-    await writeIndex(items.filter(item => !staleIds.has(item.id)));
+        await Promise.all(stale.map(item => rm(item.snapshotPath, { force: true })));
+        await writeIndexUnlocked(items.filter(item => !staleIds.has(item.id)));
+    } catch (error) {
+        log.warn("не удалось почистить старые снапшоты", { path: absPath, error: errorMessage(error) });
+    }
 }

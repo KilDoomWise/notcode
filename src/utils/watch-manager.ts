@@ -1,11 +1,22 @@
 import { watch, type FSWatcher } from "node:fs";
 import { join } from "node:path";
+import { createLogger } from "@/utils/logger";
 
 /**
  * Наблюдение за файлами: агент может узнать, что файлы изменились извне
  * (ты правишь руками, идёт сборка, дев-сервер перегенерил файлы).
- * Модель pull-based: события копятся в буфер, тул fs_watch_poll их забирает.
+ * Модель pull-based: события копятся в кольцевой буфер, тул fs_watch_poll их забирает.
  */
+
+const log = createLogger("watch");
+
+/** Больше не нужно никому, а каждый recursive-watcher — это дескрипторы и CPU. */
+const MAX_WATCHERS = 16;
+/** Забытый watcher без poll'ов гаснет сам: раньше они жили до конца жизни процесса. */
+const IDLE_TTL_MS = 60 * 60 * 1000;
+const GC_INTERVAL_MS = 5 * 60 * 1000;
+const DEBOUNCE_MS = 200;
+
 export interface WatchEvent {
     ts: string;
     type: string;
@@ -17,9 +28,12 @@ export interface WatcherInfo {
     path: string;
     recursive: boolean;
     createdAt: string;
+    lastActivity: string;
     pendingEvents: number;
     totalEvents: number;
     dropped: number;
+    /** Заполняется, если ОС отвалила наблюдение (удалили папку, потеряли права). */
+    error?: string;
 }
 
 interface WatcherState {
@@ -27,6 +41,7 @@ interface WatcherState {
     path: string;
     recursive: boolean;
     createdAt: number;
+    lastActivity: number;
     watcher: FSWatcher;
     events: WatchEvent[];
     totalEvents: number;
@@ -34,67 +49,109 @@ interface WatcherState {
     maxEvents: number;
     lastKey: string;
     lastAt: number;
+    error?: string;
 }
+
+let watcherCounter = 0;
 
 class WatchManager {
     private readonly watchers = new Map<string, WatcherState>();
+    private gcTimer: ReturnType<typeof setInterval> | null = null;
 
     start(options: { path: string; recursive?: boolean; maxEvents?: number }): WatcherInfo {
-        const id = `w-${crypto.randomUUID().slice(0, 6)}`;
-        const recursive = options.recursive ?? true;
-        const maxEvents = options.maxEvents ?? 500;
+        this.gc();
 
-        const state: WatcherState = {
+        if (this.watchers.size >= MAX_WATCHERS) {
+            throw new Error(
+                `Достигнут лимит наблюдателей (${MAX_WATCHERS}). Останови ненужные через fs_watch_stop (список — fs_watch_list).`
+            );
+        }
+
+        // Не плодим дубликаты на одну и ту же папку — возвращаем существующий.
+        for (const state of this.watchers.values()) {
+            if (state.path === options.path && state.recursive === (options.recursive ?? true) && !state.error) {
+                return this.info(state);
+            }
+        }
+
+        const id = `w${++watcherCounter}-${Math.random().toString(36).slice(2, 6)}`;
+        const recursive = options.recursive ?? true;
+        const now = Date.now();
+
+        const state: Partial<WatcherState> & { events: WatchEvent[] } = {
             id,
             path: options.path,
             recursive,
-            createdAt: Date.now(),
-            watcher: undefined as unknown as FSWatcher,
+            createdAt: now,
+            lastActivity: now,
             events: [],
             totalEvents: 0,
             dropped: 0,
-            maxEvents,
+            maxEvents: options.maxEvents ?? 500,
             lastKey: "",
             lastAt: 0
         };
 
         const handler = (eventType: string, filename: string | Buffer | null): void => {
-            const name = typeof filename === "string" ? filename : filename?.toString() ?? "";
+            const name = typeof filename === "string" ? filename : (filename?.toString() ?? "");
             const fullPath = name ? join(options.path, name) : options.path;
             const key = `${eventType}:${fullPath}`;
-            const now = Date.now();
+            const at = Date.now();
 
             // fs.watch любит дублировать события — гасим дребезг.
-            if (key === state.lastKey && now - state.lastAt < 200) return;
+            if (key === state.lastKey && at - (state.lastAt ?? 0) < DEBOUNCE_MS) return;
             state.lastKey = key;
-            state.lastAt = now;
+            state.lastAt = at;
+            state.lastActivity = at;
 
-            state.totalEvents++;
-            state.events.push({ ts: new Date(now).toISOString(), type: eventType, path: fullPath });
-            if (state.events.length > state.maxEvents) {
+            state.totalEvents = (state.totalEvents ?? 0) + 1;
+            state.events.push({ ts: new Date(at).toISOString(), type: eventType, path: fullPath });
+            if (state.events.length > (state.maxEvents ?? 500)) {
                 state.events.shift();
-                state.dropped++;
+                state.dropped = (state.dropped ?? 0) + 1;
             }
         };
 
+        let watcher: FSWatcher;
         try {
-            state.watcher = watch(options.path, { recursive, persistent: false }, handler);
+            watcher = watch(options.path, { recursive, persistent: false }, handler);
         } catch (error) {
             if (!recursive) throw error;
             // Не все платформы умеют recursive — деградируем до плоского наблюдения.
             state.recursive = false;
-            state.watcher = watch(options.path, { persistent: false }, handler);
+            watcher = watch(options.path, { persistent: false }, handler);
         }
 
-        this.watchers.set(id, state);
-        return this.info(state);
+        const full = { ...state, watcher } as WatcherState;
+
+        /**
+         * Критично: без этого обработчика ошибка FSWatcher (удалили наблюдаемую папку,
+         * отвалился сетевой диск) — это необработанное событие 'error' и падение всего сервера.
+         */
+        watcher.on("error", error => {
+            full.error = error instanceof Error ? error.message : String(error);
+            log.warn("наблюдатель остановлен из-за ошибки ФС", { id, path: full.path, error: full.error });
+            try {
+                watcher.close();
+            } catch {
+                // уже закрыт
+            }
+        });
+
+        this.watchers.set(id, full);
+        this.ensureGcTimer();
+
+        return this.info(full);
     }
 
     poll(id: string, options: { clear?: boolean; limit?: number } = {}): { info: WatcherInfo; events: WatchEvent[] } {
         const state = this.require(id);
+        state.lastActivity = Date.now();
+
         const limit = options.limit ?? 200;
         const events = state.events.slice(-limit);
         if (options.clear ?? true) state.events = [];
+
         return { info: this.info(state), events };
     }
 
@@ -110,6 +167,7 @@ class WatchManager {
             // уже закрыт
         }
         this.watchers.delete(id);
+        if (this.watchers.size === 0) this.clearGcTimer();
         return this.info(state);
     }
 
@@ -122,7 +180,42 @@ class WatchManager {
                 // игнорируем
             }
         }
+        this.clearGcTimer();
         return ids.length;
+    }
+
+    /** Сносит отвалившиеся и давно заброшенные наблюдатели. */
+    gc(): number {
+        const now = Date.now();
+        let removed = 0;
+
+        for (const [id, state] of [...this.watchers.entries()]) {
+            const idle = now - state.lastActivity > IDLE_TTL_MS;
+            if (!state.error && !idle) continue;
+            try {
+                state.watcher.close();
+            } catch {
+                // уже закрыт
+            }
+            this.watchers.delete(id);
+            removed++;
+        }
+
+        if (this.watchers.size === 0) this.clearGcTimer();
+        return removed;
+    }
+
+    private ensureGcTimer(): void {
+        if (this.gcTimer) return;
+        this.gcTimer = setInterval(() => this.gc(), GC_INTERVAL_MS);
+        // Таймер не должен удерживать процесс в живых.
+        this.gcTimer.unref?.();
+    }
+
+    private clearGcTimer(): void {
+        if (!this.gcTimer) return;
+        clearInterval(this.gcTimer);
+        this.gcTimer = null;
     }
 
     private require(id: string): WatcherState {
@@ -142,9 +235,11 @@ class WatchManager {
             path: state.path,
             recursive: state.recursive,
             createdAt: new Date(state.createdAt).toISOString(),
+            lastActivity: new Date(state.lastActivity).toISOString(),
             pendingEvents: state.events.length,
             totalEvents: state.totalEvents,
-            dropped: state.dropped
+            dropped: state.dropped,
+            ...(state.error ? { error: state.error } : {})
         };
     }
 }
