@@ -26,7 +26,9 @@
     "token": "bun run src/index.ts token",
     "audit": "bun run src/index.ts audit",
     "smoke": "bun run scripts/smoke.ts",
-    "typecheck": "bunx tsc --noEmit"
+    "e2e": "bun run scripts/e2e.ts",
+    "typecheck": "bunx tsc --noEmit",
+    "check": "bun run typecheck && bun run smoke && bun run e2e"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

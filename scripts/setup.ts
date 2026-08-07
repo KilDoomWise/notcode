@@ -8,6 +8,7 @@ import { resolve } from "node:path";
 import {
     CONFIG_DIR,
     CONFIG_FILE,
+    ConfigError,
     DEFAULT_PROFILE,
     ensureConfigDirs,
     getWorkspaceRoot,
@@ -37,6 +38,10 @@ async function main(): Promise<void> {
         }
     });
 
+    // По умолчанию слушаем 127.0.0.1 — в адресе для клиента показываем localhost.
+    const displayHost = config.host === "0.0.0.0" || config.host === "::" ? "localhost" : config.host;
+    const baseUrl = `http://${displayHost}:${config.port}`;
+
     console.log(
         box([
             isFirstRun ? "\u2705 NotCode настроен — конфиг создан" : "\u2705 NotCode уже настроен — конфиг на месте",
@@ -44,16 +49,18 @@ async function main(): Promise<void> {
             `Режим:        ${config.mode.toUpperCase()}`,
             `Воркспейс:    ${config.activeProfile} \u2192 ${getWorkspaceRoot(config)}`,
             `Тулов:        ${allTools.length}`,
-            `Адрес:        http://${config.host}:${config.port}/sse`,
+            `Адрес:        ${baseUrl}/sse`,
             `Токен:        ${config.token}`,
+            `Heartbeat:    каждые ${Math.round(config.sse.heartbeatMs / 1000)} с (держит SSE живым)`,
             `Конфиг:       ${CONFIG_FILE}`,
             `Данные:       ${CONFIG_DIR} (аудит + снапшоты)`,
             "-",
             "Дальше:",
             "  1. bun run start            — поднять сервер",
-            "  2. bun run smoke            — проверить, что всё работает",
-            "  3. bun run status           — текущие настройки",
-            "  4. bun run src/index.ts mode bypass   — полная автономия агента"
+            "  2. bun run smoke            — проверить тулы без сервера",
+            "  3. bun run e2e              — проверить живой SSE-коннект",
+            "  4. bun run status           — текущие настройки",
+            "  5. bun run src/index.ts mode bypass   — полная автономия агента"
         ])
     );
 
@@ -61,7 +68,7 @@ async function main(): Promise<void> {
     console.log(
         JSON.stringify(
             {
-                url: `http://localhost:${config.port}/sse`,
+                url: `${baseUrl}/sse`,
                 transport: "sse",
                 authentication: "Bearer token",
                 token: config.token
@@ -70,9 +77,22 @@ async function main(): Promise<void> {
             2
         )
     );
-    console.log(
-        "\nСовет: наружу выставляй только через HTTPS-реверс-прокси и никогда не коммить токен.\n"
-    );
+
+    if (!config.security.allowRuntimeModeChange || !config.security.allowRuntimeWorkspaceChange) {
+        console.log(
+            "\nЗаметка по безопасности: агент не может сам менять режим безопасности и список разрешённых папок." +
+                "\nРазрешить явно: bun run src/index.ts security runtime-mode on | runtime-workspace on"
+        );
+    }
+
+    console.log("\nСовет: наружу выставляй только через HTTPS-реверс-прокси и никогда не коммить токен.\n");
 }
 
-void main();
+main().catch((error: unknown) => {
+    if (error instanceof ConfigError) {
+        console.error(`\n❌ Конфиг сломан: ${error.message}\n`);
+        process.exit(1);
+    }
+    console.error(`\n❌ Не удалось настроить NotCode: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+});

@@ -4,14 +4,28 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+  verify:
+    name: typecheck + smoke + e2e
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
 
-      - uses: oven-sh/setup-bun@v2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
@@ -21,5 +35,16 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      - name: Smoke tests
+      # Смок дёргает тулы напрямую: быстро и без сети.
+      - name: Smoke (тулы)
         run: bun run smoke
+        env:
+          NOTCODE_LOG_LEVEL: warn
+
+      # E2E поднимает реальный SSE-сервер на отдельном порту и ждёт heartbeat —
+      # именно этот сценарий раньше ломался у пользователей через пару минут работы.
+      - name: E2E (живой SSE)
+        run: bun run e2e
+        env:
+          NOTCODE_LOG_LEVEL: warn
+          E2E_PORT: "3999"
