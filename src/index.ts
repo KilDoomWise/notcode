@@ -3,6 +3,7 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { resolve } from "node:path";
 import { createServer, toolCount } from "@/mcp";
+import { handleStreamableRequest, jsonRpcError } from "@/streamable";
 import {
     CONFIG_FILE,
     getProfile,
@@ -211,7 +212,7 @@ function startServer(config: NotCodeConfig): void {
         .onRequest(({ request, set }) => {
             set.headers["Access-Control-Allow-Origin"] = "*";
             set.headers["Access-Control-Allow-Headers"] = "*";
-            set.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
+            set.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS";
 
             if (request.method === "OPTIONS") return;
             if (new URL(request.url).pathname === "/health") return;
@@ -239,6 +240,40 @@ function startServer(config: NotCodeConfig): void {
             watchers: watchers.list().length,
             workspaceRoot: getWorkspaceRoot(config)
         }))
+        // Современный транспорт (MCP Streamable HTTP), stateless-режим.
+        // Каждый POST самодостаточен: нет долгоживущего стрима и нет sessionId, поэтому
+        // обрыв соединения больше не ломает последующие вызовы тулов.
+        .post("/mcp", async ({ body, set }) => {
+            let payload: unknown = body;
+
+            if (typeof payload === "string") {
+                try {
+                    payload = JSON.parse(payload);
+                } catch {
+                    const parseError = jsonRpcError(400, -32700, "Parse error: request body is not valid JSON");
+                    set.status = parseError.status;
+                    return parseError.body;
+                }
+            }
+
+            const result = await handleStreamableRequest(createServer, payload, config.limits.execTimeoutMs + 30_000);
+
+            set.status = result.status;
+            if (result.body === null) return "";
+            return result.body;
+        })
+        // Серверные пуши не нужны: stateless-режим отвечает на каждый POST синхронно.
+        .get("/mcp", ({ set }) => {
+            set.status = 405;
+            set.headers["Allow"] = "POST, DELETE, OPTIONS";
+            return jsonRpcError(405, -32000, "Method Not Allowed: this endpoint is stateless, use POST /mcp").body;
+        })
+        // Клиент может явно закрыть сессию; закрывать нечего, но отвечаем по спеке.
+        .delete("/mcp", ({ set }) => {
+            set.status = 204;
+            return "";
+        })
+        // Legacy SSE оставлен для клиентов, которые ещё не умеют Streamable HTTP.
         .get("/sse", ({ request, set }) => {
             let streamController: ReadableStreamDefaultController;
             const body = new ReadableStream({
@@ -376,12 +411,13 @@ function startServer(config: NotCodeConfig): void {
             `🛡️  Режим:        ${config.mode.toUpperCase()}`,
             `📁 Воркспейс:    ${config.activeProfile} → ${getWorkspaceRoot(config)}`,
             `🧰 Тулов:         ${toolCount()} (fs / terminal-сессии / git / meta)`,
-            `🌐 SSE:           http://${config.host}:${config.port}/sse`,
+            `🌐 MCP:           http://${config.host}:${config.port}/mcp  (Streamable HTTP, рекомендуется)`,
+            `🕰️  SSE (legacy):  http://${config.host}:${config.port}/sse`,
             `❤️  Health:        http://${config.host}:${config.port}/health`,
             `🔑 Bearer Token:  ${config.token}`,
             "-",
             "📌 Подключение MCP-клиента (Notion AI / Claude / Cursor):",
-            "  1. MCP server URL: адрес SSE выше (или HTTPS-адрес твоего реверс-прокси)",
+            "  1. MCP server URL: адрес /mcp выше (или HTTPS-адрес твоего реверс-прокси)",
             "  2. Authentication: Bearer token",
             `  3. Token: ${config.token}`
         ])

@@ -89,12 +89,36 @@ bun run src/index.ts mode bypass
 
 ---
 
+## 🔌 Транспорты
+
+Сервер отдаёт один и тот же набор тулов через два эндпоинта.
+
+| Эндпоинт | Транспорт | Когда использовать |
+| --- | --- | --- |
+| `POST /mcp` | Streamable HTTP (stateless) | Рекомендуется для всех современных клиентов и реверс-прокси |
+| `GET /sse` + `POST /messages` | Legacy SSE | Только для старых клиентов без поддержки Streamable HTTP |
+
+Почему `/mcp` надёжнее: каждый запрос самодостаточен, сессия не хранится между вызовами,
+и обрыв соединения не приводит к `404 Session not found` на следующем вызове тула — типичная проблема
+долгоживущих SSE-стримов за Cloudflare-туннелем или другим реверс-прокси.
+
+Проверка подключения:
+
+```bash
+curl -X POST http://127.0.0.1:3000/mcp \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+---
+
 ## 📜 Команды CLI
 
 | Команда | Описание |
 | --- | --- |
 | `bun run setup` | Первичная настройка и параметры подключения |
-| `bun run start` | Запуск MCP-сервера (SSE + Bearer) |
+| `bun run start` | Запуск MCP-сервера (Streamable HTTP + legacy SSE, Bearer) |
 | `bun run dev` | Запуск в режиме разработки (watch mode) |
 | `bun run status` | Статус сервера, текущий режим и лимиты |
 | `bun run token` | Посмотреть или пересоздать токен (`--reset`) |
