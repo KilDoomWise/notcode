@@ -36,3 +36,8 @@ desktop.ini
 .vscode/*
 !.vscode/extensions.json
 *.swp
+
+# Разовые дампы кодовой базы и скрипты инспекции
+codebase.md
+codebase.py
+inspect-dump.ps1

@@ -165,7 +165,7 @@ async function waitForServer(): Promise<boolean> {
 async function main(): Promise<void> {
     const config = await loadConfig();
 
-    console.log(`\n\u2500\u2500 NotCode E2E (живой SSE) \u2500\u2500\nпорт: ${PORT}\nheartbeat: ${config.sse.heartbeatMs} ms\n`);
+    console.log(`\n\u2500\u2500 NotCode E2E (streamable-http + legacy SSE) \u2500\u2500\nпорт: ${PORT}\nheartbeat: ${config.sse.heartbeatMs} ms\n`);
 
     const server = Bun.spawn(["bun", "run", "src/index.ts", "start"], {
         env: {
@@ -185,6 +185,94 @@ async function main(): Promise<void> {
         check("сервер поднялся и отвечает на /health", up);
         if (!up) return;
 
+        // ─── Основной транспорт: Streamable HTTP (stateless) ────────────
+        const initParams = {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "notcode-e2e", version: "1.0.0" }
+        };
+        const statusToolName = config.toolAliases["notcode_status"] ?? "notcode_status";
+
+        const mcpNoAuth = await fetch(`${BASE}/mcp`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: initParams })
+        });
+        check("/mcp без токена отвечает 401", mcpNoAuth.status === 401, `status=${mcpNoAuth.status}`);
+        await mcpNoAuth.body?.cancel();
+
+        /** Один POST = один законченный JSON-RPC обмен. Никаких сессий. */
+        const callMcp = async (
+            payload: Record<string, unknown>,
+            accept = "application/json"
+        ): Promise<{ status: number; raw: string; message: JsonRpcMessage | null }> => {
+            const result = await fetch(`${BASE}/mcp`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    Accept: accept,
+                    Authorization: `Bearer ${config.token}`
+                },
+                body: JSON.stringify(payload),
+                signal: AbortSignal.timeout(RPC_TIMEOUT_MS)
+            });
+            const raw = await result.text();
+            let message: JsonRpcMessage | null = null;
+            try {
+                message = JSON.parse(raw) as JsonRpcMessage;
+            } catch {
+                message = null;
+            }
+            return { status: result.status, raw, message };
+        };
+
+        const mcpInit = await callMcp({ jsonrpc: "2.0", id: 1, method: "initialize", params: initParams });
+        check(
+            "POST /mcp: initialize отвечает 200",
+            mcpInit.status === 200,
+            `status=${mcpInit.status} body=${mcpInit.raw.slice(0, 300)}`
+        );
+        check(
+            "POST /mcp: ответ приходит тем же запросом (без SSE)",
+            mcpInit.message?.result !== undefined && "serverInfo" in (mcpInit.message.result ?? {}),
+            mcpInit.raw.slice(0, 300)
+        );
+
+        // Клиенты часто присылают Accept: application/json без text/event-stream.
+        const mcpTools = await callMcp({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+        check(
+            "POST /mcp: tools/list работает с неполным Accept",
+            mcpTools.status === 200,
+            `status=${mcpTools.status} body=${mcpTools.raw.slice(0, 300)}`
+        );
+        const mcpToolList = (mcpTools.message?.result?.tools ?? []) as Array<{ name: string }>;
+        check(`POST /mcp: тулов в списке ${mcpToolList.length}`, mcpToolList.length >= 30, mcpTools.raw.slice(0, 300));
+
+        const mcpCall = await callMcp({
+            jsonrpc: "2.0",
+            id: 3,
+            method: "tools/call",
+            params: { name: statusToolName, arguments: {} }
+        });
+        check(
+            "POST /mcp: tools/call выполняется",
+            mcpCall.status === 200 && mcpCall.raw.includes("workspaceRoot"),
+            `status=${mcpCall.status} body=${mcpCall.raw.slice(0, 300)}`
+        );
+
+        const mcpGet = await fetch(`${BASE}/mcp`, { headers: { Authorization: `Bearer ${config.token}` } });
+        check("GET /mcp отвечает 405: висящий стрим не нужен", mcpGet.status === 405, `status=${mcpGet.status}`);
+        await mcpGet.body?.cancel();
+
+        const afterMcp = await fetch(`${BASE}/status`, { headers: { Authorization: `Bearer ${config.token}` } });
+        const afterMcpJson = (await afterMcp.json()) as { sessions?: number; transport?: string };
+        check(
+            "после серии MCP-запросов сессий не осталось",
+            afterMcpJson.sessions === 0,
+            `sessions=${afterMcpJson.sessions}`
+        );
+
+        // ─── Legacy SSE: должен продолжать работать для старых клиентов ─────
         const noAuth = await fetch(`${BASE}/sse`, { headers: { Accept: "text/event-stream" } });
         check("/sse без токена отвечает 401", noAuth.status === 401, `status=${noAuth.status}`);
         await noAuth.body?.cancel();
@@ -263,10 +351,13 @@ async function main(): Promise<void> {
             const parsed = JSON.parse(toolsFrame.data) as JsonRpcMessage;
             const tools = (parsed.result?.tools ?? []) as Array<{ name: string; annotations?: unknown }>;
             check(`тулов в списке: ${tools.length}`, tools.length >= 30, JSON.stringify(tools.map(t => t.name)));
+            // Аннотации намеренно НЕ отдаются клиенту (см. src/mcp.ts):
+            // из-за их смены Notion AI блокировал тулы с "changed its operation
+            // type" и не показывал кнопку повторного одобрения.
             check(
-                "annotations доехали до клиента",
-                tools.every(tool => tool.annotations !== undefined),
-                JSON.stringify(tools.filter(tool => tool.annotations === undefined).map(tool => tool.name))
+                "annotations намеренно не отдаются клиенту",
+                tools.every(tool => tool.annotations === undefined),
+                JSON.stringify(tools.filter(tool => tool.annotations !== undefined).map(tool => tool.name))
             );
         }
 

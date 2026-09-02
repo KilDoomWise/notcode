@@ -7,15 +7,6 @@ import { createLogger, errorMessage } from "@/utils/logger";
 
 const log = createLogger("config");
 
-/**
- * Режимы безопасности:
- *  - paranoic: только внутри корня активного воркспейса
- *  - auto: корень + явно разрешённые папки (allowedPaths)
- *  - bypass: без ограничений (полностью автономный агент)
- *
- * ВАЖНО: режим ограничивает только файловые пути. Команды в терминале выполняются
- * с правами пользователя в любом режиме — сандбоксится лишь рабочая директория.
- */
 export type SecurityMode = "paranoic" | "auto" | "bypass";
 
 export const SECURITY_MODES: readonly SecurityMode[] = ["paranoic", "auto", "bypass"] as const;
@@ -33,20 +24,15 @@ export interface WorkspaceProfile {
 export interface AuditSettings {
     enabled: boolean;
     maxEntries: number;
-    /** Потолок размера audit.jsonl: превышен — лог ротируется, не дожидаясь счётчика записей. */
     maxFileBytes: number;
 }
 
 export interface SnapshotSettings {
     enabled: boolean;
     keepPerFile: number;
-    /** Файлы больше этого размера не снапшотятся: один бинарь или лог иначе съедает весь диск. */
     maxFileBytes: number;
-    /** Общий потолок папки снапшотов: старые версии сносятся, пока не влезем. */
     maxTotalBytes: number;
-    /** Снапшоты старше N дней удаляются. */
     maxAgeDays: number;
-    /** Осиротевшие снапшоты (исходный файл удалён) живут не дольше N часов. */
     orphanTtlHours: number;
 }
 
@@ -54,50 +40,47 @@ export interface LimitSettings {
     execTimeoutMs: number;
     maxOutputChars: number;
     maxReadChars: number;
-    /** Одновременных терминал-сессий. */
     maxSessions: number;
     sessionBufferChars: number;
-    /** Одновременных fs.watch: каждый держит хендлы ОС и копит события. */
     maxWatchers: number;
-    /** Watcher без fs_watch_poll дольше этого времени гаснет сам. */
     watcherIdleMs: number;
-    /** Простаивающая терминал-сессия закрывается сама (running-команды не трогаем). */
     terminalIdleMs: number;
-    /** Период фонового обслуживания: GC сессий, watcher'ов, снапшотов, ротация аудита. */
     gcIntervalMs: number;
 }
 
-/**
- * Разрешения на самомодификацию. По умолчанию выключены: иначе одна prompt injection
- * в чужом README превращает paranoic в bypass без ведома человека.
- */
 export interface SecuritySettings {
-    /** Разрешить тулу notcode_set_mode менять режим на лету. */
     allowRuntimeModeChange: boolean;
-    /** Разрешить тулам workspace_add / workspace_allow расширять доступ на лету. */
     allowRuntimeWorkspaceChange: boolean;
 }
 
-/** Настройки SSE-транспорта — именно они отвечают за то, чтобы сессия не умирала в простое. */
 export interface SseSettings {
-    /** Период keepalive-комментариев в поток. 0 — выключить (не рекомендуется). */
     heartbeatMs: number;
-    /** idleTimeout сервера Bun в секундах (максимум 255). */
     idleTimeoutSec: number;
-    /**
-     * Потолок одновременных SSE-сессий. MCP-клиент открывает новый поток на каждую попытку
-     * переподключения; без потолка их набираются сотни, и каждая держит свой MCP-сервер
-     * в памяти. При превышении закрывается самая старая простаивающая сессия.
-     */
     maxSessions: number;
-    /** SSE-сессия без единого сообщения дольше этого времени закрывается фоновой уборкой. */
     sessionIdleMs: number;
+    /**
+     * Путь основного Streamable-HTTP эндпоинта. По умолчанию "/mcp".
+     * Это главный транспорт: один POST = запрос + ответ, без висящих
+     * соединений и без sessionId.
+     */
+    mcpPath: string;
+    /**
+     * Путь legacy SSE-эндпоинта. По умолчанию "/sse".
+     * Смени на "/socket" или другой, если клиент не находит "/sse"
+     * или Notion кеширует старый путь.
+     * Должен начинаться с "/".
+     */
+    ssePath: string;
+    /**
+     * Путь для POST-сообщений MCP. По умолчанию "/messages".
+     * Меняй вместе с ssePath при необходимости.
+     */
+    messagesPath: string;
 }
 
 export interface NotCodeConfig {
     token: string;
     mode: SecurityMode;
-    /** Легаси-список разрешённых папок (учитывается вместе с профильным). */
     allowedPaths: string[];
     port: number;
     host: string;
@@ -108,6 +91,13 @@ export interface NotCodeConfig {
     limits: LimitSettings;
     security: SecuritySettings;
     sse: SseSettings;
+    /**
+     * Публичные алиасы тулов: { "realName": "publicName" }.
+     * Если Notion заблокировал тул из-за смены аннотаций — переименуй его здесь.
+     * Команда: bun run src/index.ts tools alias <realName> <newName>
+     * Сбросить всё разом: bun run src/index.ts fix
+     */
+    toolAliases: Record<string, string>;
 }
 
 export const CONFIG_DIR = join(homedir(), ".notcode");
@@ -119,16 +109,14 @@ export const SNAPSHOT_INDEX = join(SNAPSHOT_DIR, "index.jsonl");
 export const DEFAULT_PROFILE = "default";
 export const DEFAULT_ROOT = resolve(process.env.WORKSPACE_ROOT || process.cwd());
 
-/** @deprecated Используй getWorkspaceRoot(config) — корень зависит от активного профиля. */
+/** @deprecated Используй getWorkspaceRoot(config) */
 export const WORKSPACE_ROOT = DEFAULT_ROOT;
 
 const CACHE_TTL_MS = 1_000;
 
 let cache: { config: NotCodeConfig; at: number } | null = null;
-/** Неизвестные ключи из файла — сохраняем их, чтобы ручные правки не исчезали при первой же записи. */
 let passthrough: Record<string, unknown> = {};
 
-/** Все записи конфига сериализуются: без этого два параллельных updateConfig теряют правки. */
 const configMutex = new Mutex();
 
 export class ConfigError extends Error {
@@ -147,7 +135,8 @@ const KNOWN_KEYS = new Set([
     "snapshots",
     "limits",
     "security",
-    "sse"
+    "sse",
+    "toolAliases"
 ]);
 
 function defaults(): NotCodeConfig {
@@ -156,7 +145,6 @@ function defaults(): NotCodeConfig {
         mode: "auto",
         allowedPaths: [],
         port: 3000,
-        // Слушать всю сеть опасно: у сервера полный доступ к ФС и shell.
         host: "127.0.0.1",
         activeProfile: DEFAULT_PROFILE,
         profiles: [{ name: DEFAULT_PROFILE, root: DEFAULT_ROOT, allowedPaths: [] }],
@@ -188,8 +176,14 @@ function defaults(): NotCodeConfig {
             heartbeatMs: 15_000,
             idleTimeoutSec: 255,
             maxSessions: 32,
-            sessionIdleMs: 30 * 60_000
-        }
+            // 5 минут вместо 30: мёртвый SSE-канал не должен занимать слот
+            // полчаса. Основной транспорт (mcpPath) сессий вообще не держит.
+            sessionIdleMs: 5 * 60_000,
+            mcpPath: "/mcp",
+            ssePath: "/sse",
+            messagesPath: "/messages"
+        },
+        toolAliases: {}
     };
 }
 
@@ -197,12 +191,20 @@ function asStringArray(value: unknown): string[] {
     return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
-/** Положительное число (для лимитов, где 0 не имеет смысла). */
+function asStringRecord(value: unknown): Record<string, string> {
+    const out: Record<string, string> = {};
+    if (typeof value === "object" && value !== null) {
+        for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+            if (typeof v === "string" && v.trim().length > 0) out[k] = v.trim();
+        }
+    }
+    return out;
+}
+
 function positive(value: unknown, fallback: number): number {
     return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
-/** Неотрицательное число: 0 — осмысленное значение (выключить heartbeat, случайный порт). */
 function nonNegative(value: unknown, fallback: number): number {
     return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
 }
@@ -219,21 +221,26 @@ function record(value: unknown): Record<string, unknown> {
     return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
 }
 
-/** Приводит конфиг любой (в т.ч. старой) формы к актуальной схеме. */
+function normalizeSsePath(value: unknown, fallback: string): string {
+    if (typeof value !== "string" || value.trim().length === 0) return fallback;
+    const p = value.trim();
+    return p.startsWith("/") ? p : `/${p}`;
+}
+
 function normalize(raw: Record<string, unknown>): NotCodeConfig {
     const base = defaults();
     const legacyAllowed = asStringArray(raw.allowedPaths);
 
     const rawProfiles = Array.isArray(raw.profiles) ? (raw.profiles as Record<string, unknown>[]) : [];
     const profiles: WorkspaceProfile[] = rawProfiles
-        .filter(profile => typeof profile?.name === "string" && typeof profile?.root === "string")
-        .map(profile => ({
-            name: String(profile.name),
-            root: resolve(String(profile.root)),
-            allowedPaths: asStringArray(profile.allowedPaths).map(item => resolve(item))
+        .filter(p => typeof p?.name === "string" && typeof p?.root === "string")
+        .map(p => ({
+            name: String(p.name),
+            root: resolve(String(p.root)),
+            allowedPaths: asStringArray(p.allowedPaths).map(i => resolve(i))
         }));
 
-    if (!profiles.some(profile => profile.name === DEFAULT_PROFILE)) {
+    if (!profiles.some(p => p.name === DEFAULT_PROFILE)) {
         profiles.unshift({ name: DEFAULT_PROFILE, root: DEFAULT_ROOT, allowedPaths: [...legacyAllowed] });
     }
 
@@ -247,10 +254,10 @@ function normalize(raw: Record<string, unknown>): NotCodeConfig {
     return {
         token: typeof raw.token === "string" && raw.token.length > 0 ? raw.token : base.token,
         mode: isSecurityMode(raw.mode) ? raw.mode : base.mode,
-        allowedPaths: legacyAllowed.map(item => resolve(item)),
+        allowedPaths: legacyAllowed.map(i => resolve(i)),
         port: clamp(Math.trunc(nonNegative(raw.port, base.port)), 0, 65_535),
         host: typeof raw.host === "string" && raw.host.length > 0 ? raw.host : base.host,
-        activeProfile: profiles.some(profile => profile.name === activeProfile) ? activeProfile : DEFAULT_PROFILE,
+        activeProfile: profiles.some(p => p.name === activeProfile) ? activeProfile : DEFAULT_PROFILE,
         profiles,
         audit: {
             enabled: bool(audit.enabled, base.audit.enabled),
@@ -287,8 +294,12 @@ function normalize(raw: Record<string, unknown>): NotCodeConfig {
             heartbeatMs: clamp(Math.trunc(nonNegative(sse.heartbeatMs, base.sse.heartbeatMs)), 0, 120_000),
             idleTimeoutSec: clamp(Math.trunc(positive(sse.idleTimeoutSec, base.sse.idleTimeoutSec)), 10, 255),
             maxSessions: Math.trunc(clamp(positive(sse.maxSessions, base.sse.maxSessions), 1, 1_024)),
-            sessionIdleMs: positive(sse.sessionIdleMs, base.sse.sessionIdleMs)
-        }
+            sessionIdleMs: positive(sse.sessionIdleMs, base.sse.sessionIdleMs),
+            mcpPath: normalizeSsePath(sse.mcpPath, base.sse.mcpPath),
+            ssePath: normalizeSsePath(sse.ssePath, base.sse.ssePath),
+            messagesPath: normalizeSsePath(sse.messagesPath, base.sse.messagesPath)
+        },
+        toolAliases: asStringRecord(raw.toolAliases)
     };
 }
 
@@ -305,12 +316,6 @@ export async function ensureConfigDirs(): Promise<void> {
     await mkdir(SNAPSHOT_DIR, { recursive: true });
 }
 
-/**
- * Загружает конфиг с коротким кэшем — sandbox дёргает его на каждый вызов тула.
- *
- * Битый файл НЕ пересоздаётся молча: раньше это генерировало новый токен,
- * все клиенты получали 401 и "Failed to connect to MCP server" без объяснений.
- */
 export async function loadConfig(options: { force?: boolean } = {}): Promise<NotCodeConfig> {
     if (!options.force && cache && Date.now() - cache.at < CACHE_TTL_MS) {
         return cache.config;
@@ -329,8 +334,7 @@ export async function loadConfig(options: { force?: boolean } = {}): Promise<Not
             throw new ConfigError(
                 `Конфиг повреждён и не разобран как JSON: ${CONFIG_FILE}\n` +
                     `Копия сохранена: ${backup}\n` +
-                    `Восстанови токен из копии вручную или выполни \`bun run setup\` для чистой настройки ` +
-                    `(токен сменится — придётся обновить его в клиенте).`
+                    `Восстанови токен из копии вручную или выполни \`bun run setup\` для чистой настройки.`
             );
         }
 
@@ -352,7 +356,6 @@ export async function saveConfig(config: NotCodeConfig): Promise<void> {
     cache = { config, at: Date.now() };
 }
 
-/** Атомарно читает, мутирует и сохраняет конфиг (с сериализацией конкурентных вызовов). */
 export async function updateConfig(
     mutator: (config: NotCodeConfig) => void | Promise<void>
 ): Promise<NotCodeConfig> {
@@ -371,7 +374,7 @@ export function invalidateConfigCache(): void {
 export function getProfile(config: NotCodeConfig, name?: string): WorkspaceProfile {
     const target = name ?? config.activeProfile;
     return (
-        config.profiles.find(profile => profile.name === target) ??
+        config.profiles.find(p => p.name === target) ??
         config.profiles[0] ?? { name: DEFAULT_PROFILE, root: DEFAULT_ROOT, allowedPaths: [] }
     );
 }
@@ -393,10 +396,6 @@ export interface ListenOverrides {
     host?: string | undefined;
 }
 
-/**
- * Переопределения адреса из окружения. Намеренно НЕ попадают в файл конфига:
- * это разовые настройки запуска (CI, тесты, второй экземпляр рядом).
- */
 export function envListenOverrides(): ListenOverrides {
     const overrides: ListenOverrides = {};
 

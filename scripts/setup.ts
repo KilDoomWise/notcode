@@ -49,16 +49,17 @@ async function main(): Promise<void> {
             `Режим:        ${config.mode.toUpperCase()}`,
             `Воркспейс:    ${config.activeProfile} \u2192 ${getWorkspaceRoot(config)}`,
             `Тулов:        ${allTools.length}`,
-            `Адрес:        ${baseUrl}/sse`,
+            `MCP-адрес:    ${baseUrl}${config.sse.mcpPath}`,
+            `Legacy SSE:   ${baseUrl}${config.sse.ssePath}`,
             `Токен:        ${config.token}`,
-            `Heartbeat:    каждые ${Math.round(config.sse.heartbeatMs / 1000)} с (держит SSE живым)`,
+            `Heartbeat:    каждые ${Math.round(config.sse.heartbeatMs / 1000)} с (только для legacy SSE)`,
             `Конфиг:       ${CONFIG_FILE}`,
             `Данные:       ${CONFIG_DIR} (аудит + снапшоты)`,
             "-",
             "Дальше:",
             "  1. bun run start            — поднять сервер",
             "  2. bun run smoke            — проверить тулы без сервера",
-            "  3. bun run e2e              — проверить живой SSE-коннект",
+            "  3. bun run e2e              — проверить живой коннект (/mcp + legacy)",
             "  4. bun run status           — текущие настройки",
             "  5. bun run src/index.ts mode bypass   — полная автономия агента"
         ])
@@ -68,8 +69,8 @@ async function main(): Promise<void> {
     console.log(
         JSON.stringify(
             {
-                url: `${baseUrl}/sse`,
-                transport: "sse",
+                url: `${baseUrl}${config.sse.mcpPath}`,
+                transport: "streamable-http",
                 authentication: "Bearer token",
                 token: config.token
             },
